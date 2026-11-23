@@ -476,7 +476,9 @@ def parse_claim(raw, hits):
         return None, "模型输出不是合法 JSON"
     if not isinstance(claim, dict):
         return None, "模型输出不是对象"
-    if not (claim.get("claim") or "").strip():
+    # 字段名兼容：机器生成的证据多用 claim.text，模型直出时多用 claim.claim
+    text = (claim.get("claim") or claim.get("text") or "").strip()
+    if not text:
         return None, "未从检索结果中得到明确结论"
     url = (claim.get("source_url") or "").strip()
     known = {h["url"] for h in hits}
@@ -490,6 +492,8 @@ def parse_claim(raw, hits):
         return None, "支撑片段与来源内容不符"
     claim["source_type"] = claim.get("source_type") if claim.get("source_type") in SOURCE_TIERS \
         else "unknown"
+    # 归一化字段名，下游统一用 claim
+    claim["claim"] = text
     return claim, ""
 
 
@@ -500,6 +504,147 @@ def external_verdict(claim):
     if claim["source_type"] in DOCUMENTED_SOURCES:
         return "DOCUMENTED"
     return "UNVERIFIED_HYPOTHESIS"
+
+
+# ---------------------------------------------------------------------------
+# 阶段 4 模式 A：待查清单（脚本产出，agent 执行检索）
+#
+# 为什么不让脚本自己检索：
+#   实测把搜索结果页抓下来再解析 HTML 非常脆弱——查询词稍偏，返回的可能是
+#   完全不相关的页面（例如搜序列记号却返回视频网站），而且中文搜索引擎对
+#   英文技术术语召回很差。真正管用的是：读页面内容、判断相关性、换词重试。
+#   这是 agent 的强项，不是脚本的强项。所以脚本只产出"要查什么"，
+#   检索由 agent 用它自己的联网工具完成。
+# ---------------------------------------------------------------------------
+QUERY_MANIFEST_TEMPLATE = {
+    "instructions": [
+        "对 unresolved 里的每一项，使用你的联网检索能力（web_search / web_fetch 等）查明该记号的约定。",
+        "优先找**产生该记号的工具**的官方文档；其次论文；再次分析流程文档；最后论坛/issue。",
+        "每条结论必须附带：能打开的 url、该页面上**原文出现**的片段、来源类型。",
+        "查不到就如实留空——不要用相似记号的结论套用，不要凭记忆编造来源。",
+        "把结果写成 JSON 到 --evidence文件，格式见 response_schema，然后重新运行本脚本并加 --evidence。",
+    ],
+    "evidence_quality_rules": {
+        "DOCUMENTED": "需要 official_docs / peer_reviewed / protocol 级别的来源，"
+                      "且 url 与原文片段都要能对应上",
+        "UNVERIFIED_HYPOTHESIS": "只有 forum 级来源，或来源无法对应具体结论",
+        "UNTESTABLE": "没有找到任何记载，或找到的都是其它记号的记载",
+    },
+}
+
+
+def _emit_query_manifest(args, findings, need_external, by_pattern):
+    """产出待查清单：告诉 agent 要查什么、什么算合格证据、结果怎么写回来。"""
+    unresolved = []
+    for f in need_external:
+        info = by_pattern[f["pattern"]]
+        unresolved.append({
+            "pattern": f["pattern"],
+            "hypothesis": f.get("hypothesis", ""),
+            "description": info["description"],
+            "example": info.get("example", ""),
+            "occurrences": info.get("count", 0),
+            "distinct_tokens": info.get("distinct", []),
+            "why_unresolved": f.get("reason") or f["verdict"],
+            "question": f"什么工具或流程会产生这种记号？它对“{info['description']}”的约定是什么？",
+            "suggested_queries": _suggest_queries(f, info),
+        })
+    manifest = dict(QUERY_MANIFEST_TEMPLATE)
+    manifest.update({
+        "sequence_column": args.seq_col,
+        "reference_column": args.ref_col,
+        "unresolved": unresolved,
+        "response_schema": {
+            "<pattern>": {
+                "search_queries": ["<你实际用过的检索式>"],
+                "hits": [{"title": "<页面标题>", "url": "<可打开的链接>",
+                          "snippet": "<页面上原文出现的片段>"}],
+                "claim": {
+                    "text": "<一句话结论；查不到就留空串>",
+                    "source_url": "<必须是 hits 里出现过的 url，或空串>",
+                    "supporting_snippet": "<必须与 hits 中该 url 的 snippet 相符，或空串>",
+                    "source_type": "official_docs|peer_reviewed|protocol|forum|unknown",
+                },
+            }
+        },
+    })
+    with open(args.emit_queries, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2)
+
+
+def _suggest_queries(finding, info):
+    """给出检索式建议。agent 可以改，这只是起点。"""
+    desc = info["description"]
+    tokens = " ".join(str(t) for t in info.get("distinct", [])[:3])
+    return [
+        f"{tokens} sequence notation meaning".strip(),
+        f"{desc} 序列记号 含义 工具",
+        f"which tool produces {tokens} marker in sequence files".strip(),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 阶段 4 模式 A（续）：读入 agent 查回的证据并裁定
+# ---------------------------------------------------------------------------
+def _ingest_evidence(args, findings, need_external, by_pattern):
+    """读入 agent 提供的证据文件，做与 --search-cmd 完全相同的校验与裁定。
+
+    校验逻辑不因来源不同而放松：url 必须在该记号的 hits 里真实出现，
+    支撑片段必须与来源相符，否则该结论被拒、降级 UNTESTABLE。
+    """
+    try:
+        # utf-8-sig：容忍 BOM。agent 或编辑器写出的 JSON 常带 BOM，
+        # 用纯 utf-8 读会在第一个字符处直接失败。
+        with open(args.evidence, encoding="utf-8-sig") as fh:
+            evidence = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"  [错误] 无法读取证据文件：{exc}")
+        for f in need_external:
+            f["external"] = {"verdict": "UNTESTABLE", "reason": f"证据文件不可读：{exc}"}
+        return
+    if not isinstance(evidence, dict):
+        print("  [错误] 证据文件应为对象：{pattern: {...}}")
+        for f in need_external:
+            f["external"] = {"verdict": "UNTESTABLE", "reason": "证据文件格式错误"}
+        return
+
+    print(f"\n阶段 4  读入 agent 提供的证据：{args.evidence}")
+    for f in need_external:
+        pattern = f["pattern"]
+        entry = evidence.get(pattern)
+        if not isinstance(entry, dict):
+            f["external"] = {"verdict": "UNTESTABLE", "reason": "证据文件中无该记号的条目"}
+            print(f"  · {pattern}: 证据文件中没有对应条目 → UNTESTABLE")
+            continue
+
+        hits = [h for h in (entry.get("hits") or []) if isinstance(h, dict) and h.get("url")]
+        f["search_queries"] = entry.get("search_queries") or []
+        f["search_hits"] = [{"url": h["url"], "title": h.get("title", "")} for h in hits]
+        print(f"  · {pattern}: agent 提供 {len(hits)} 条来源")
+
+        claim_raw = entry.get("claim")
+        if not isinstance(claim_raw, dict):
+            f["external"] = {"verdict": "UNTESTABLE", "reason": "未提供结论对象"}
+            print("      未提供结论 → UNTESTABLE")
+            continue
+        claim, why = parse_claim(json.dumps(claim_raw, ensure_ascii=False), hits)
+        ev = external_verdict(claim)
+        f["external"] = {
+            "verdict": ev, "reason": why,
+            "claim": (claim or {}).get("claim", ""),
+            "source_url": (claim or {}).get("source_url", ""),
+            "source_type": (claim or {}).get("source_type", ""),
+            "supporting_snippet": (claim or {}).get("supporting_snippet", ""),
+            "provided_by": "agent",
+        }
+        if claim:
+            f["derived_prediction"] = "span_equals_number_in_token"
+            print(f"      结论[{ev}] {claim['claim']}")
+            print(f"      来源({claim['source_type']}): {claim['source_url']}")
+            if ev == "DOCUMENTED":
+                print("      注意：文献级证据，未经数据验证；拿到参照列后请转成预测实测。")
+        else:
+            print(f"      结论被拒（{why}）→ {ev}")
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +665,12 @@ def main(argv=None):
                         help="用内置合成检索结果离线自检（URL 为 example.invalid 占位符）")
     parser.add_argument("--search-cmd", default=None,
                         help="检索桥命令：从 stdin 读查询串、把 JSON 结果列表写 stdout；"
-                             "每条为 {title, url, snippet}")
+                             "每条为 {title, url, snippet}。适合已有搜索 API 的场景")
+    parser.add_argument("--emit-queries", default=None,
+                        help="【推荐】产出待查清单 JSON，由具备联网能力的 agent 执行检索，"
+                             "结果写成证据文件后用 --evidence 喂回")
+    parser.add_argument("--evidence", default=None,
+                        help="读入 agent 检索后写好的证据 JSON，做校验与裁定")
     parser.add_argument("--flank", type=int, default=15)
     parser.add_argument("--sample-rows", type=int, default=20000)
     parser.add_argument("--anchor-limit", type=int, default=3000,
@@ -531,6 +681,10 @@ def main(argv=None):
 
     if not args.llm and not args.llm_cmd:
         print("[错误] 请指定 --llm mock 或 --llm-cmd '<命令>'")
+        return 2
+    if args.emit_queries and args.evidence:
+        print("[错误] --emit-queries 与 --evidence 不能同时使用："
+              "先产出清单、检索后再喂回证据。")
         return 2
 
     print("阶段 1/5  观察数据（确定性扫描）……")
@@ -589,14 +743,36 @@ def main(argv=None):
         findings.append(entry)
 
     # ---------------- 阶段 4：外部证据（数据内判不了的，去查资料，而不是猜） -------------
+    #
+    # 三种模式，按推荐程度排序：
+    #   A. --emit-queries FILE  → 脚本只产出"待查清单"，由 agent（具备 web_search/web_fetch
+    #      的宿主，如 DSH）去检索并写回证据，再 --evidence FILE 回来裁定。
+    #      这是推荐用法：检索需要"读页面、判断相关性、换词重试"，正是 agent 的强项，
+    #      而脚本拼 URL 抓搜索结果页再解析 HTML 非常脆弱（实测会返回完全不相关的结果）。
+    #   B. --search mock       → 离线合成检索，仅用于跑通与单测。
+    #   C. --search-cmd "..."  → 自带检索桥，全自动；适合已有搜索引擎 API 的场景。
     need_external = [f for f in findings
                      if f["verdict"] in ("UNTESTABLE", "WEAK")
                      and f.get("pattern") in by_pattern]
-    if need_external:
+
+    if need_external and args.emit_queries:
+        _emit_query_manifest(args, findings, need_external, by_pattern)
+        print(f"\n阶段 4  已产出待查清单：{args.emit_queries}")
+        print("  下一步：由具备联网能力的 agent 按清单检索，把结果写成证据文件，")
+        print("  再执行：python discover_conventions.py <同一 csv> --seq-col ... "
+              f"--evidence <证据文件> --emit-rules rules.json")
+        print("  说明：检索需要读页面、判断相关性、换词重试，这是 agent 的职责；")
+        print("        脚本只负责产出清单与最终裁定，不做网络请求。")
+        return 0
+
+    if need_external and args.evidence:
+        _ingest_evidence(args, findings, need_external, by_pattern)
+    elif need_external and not (args.search or args.search_cmd):
+        print(f"\n阶段 4  数据内无法判定 {len(need_external)} 条")
+        print("  未提供外部证据来源，这些保持 UNTESTABLE —— 不猜。")
+        print("  建议：加 --emit-queries q.json 产出待查清单，让 agent 去查。")
+    elif need_external:
         print(f"\n阶段 4  数据内无法判定 {len(need_external)} 条，转入外部证据检索……")
-        if not (args.search or args.search_cmd):
-            print("  未提供检索接口（--search mock 或 --search-cmd），"
-                  "这两条保持 UNTESTABLE —— 不猜。")
         for f in need_external:
             info = by_pattern[f["pattern"]]
             q_prompt = SEARCH_PROMPT.format(

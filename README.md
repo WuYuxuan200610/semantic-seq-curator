@@ -162,18 +162,63 @@ URL 用 `example.invalid` 占位，**不是真实文献**）：
   "requires_small_sample_check": false, "maps_to": "占位符 -> k 个 N"}]
 ```
 
-**接入真实检索与真实模型**（本会话未能实测，见下方说明）：
+### 外部证据：脚本不碰网络，检索交给 agent
+
+**为什么不让脚本自己检索？** 实测过：把搜索结果页抓下来再解析 HTML 非常脆弱——
+查询词稍偏就返回完全不相关的内容（搜序列记号却返回视频网站），
+中文搜索引擎对英文技术术语召回也很差。真正管用的是**读页面内容、判断相关性、换词重试**，
+这是 agent 的强项，不是脚本的强项。
+
+所以这里做成**两阶段的文件交换**，脚本保持纯确定性、不发任何网络请求：
 
 ```bash
-# 检索桥：从 stdin 读查询串，把 JSON 结果列表写 stdout，每条为 {title, url, snippet}
+# 第一趟：脚本产出「待查清单」——要查什么、什么算合格证据、结果怎么写回来
+python discover_conventions.py <raw.csv> --seq-col Sequence --emit-queries queries.json
+
+# 中间：由具备联网能力的 agent（如 DSH 会话）读清单、执行检索、写出证据文件
+#       agent 用它自己的 web_search / web_fetch，无需本仓库配置任何 API key
+
+# 第二趟：脚本读入证据，做与自动检索完全相同的防幻觉校验，然后裁定
+python discover_conventions.py <raw.csv> --seq-col Sequence \
+    --evidence evidence.json --emit-rules rules.json
+```
+
+清单长这样（节选）：
+
+```json
+{"instructions": ["对 unresolved 里的每一项，使用你的联网检索能力查明该记号的约定", "..."],
+ "evidence_quality_rules": {"DOCUMENTED": "需要 official_docs / peer_reviewed / protocol 级来源，且 url 与原文片段都要能对应上"},
+ "unresolved": [{"pattern": "star_bracket_number", "description": "星号方括号数字记号，如 *[19]*",
+                 "occurrences": 6039, "question": "什么工具会产生这种记号？",
+                 "suggested_queries": ["... sequence notation meaning", "..."]}],
+ "response_schema": {"<pattern>": {"search_queries": [...], "hits": [{...}], "claim": {...}}}}
+```
+
+**校验不因来源不同而放松**：即使证据是 agent 提供的，URL 仍必须真实出现在该记号的 hits 里、
+支撑片段仍必须与来源相符，否则结论被拒、降级 `UNTESTABLE`。
+
+**关于本仓库所在宿主（DSH）的联网能力**，实测状态如下：
+
+| 工具 | 状态 | 说明 |
+|---|---|---|
+| `web_fetch`（直连 URL） | ✅ 可用 | 已验证可抓取任意 http(s) 页面 |
+| `web_search`（关键词检索） | ❌ 当前不可用 | HTTP 402，走 DeepSeek 单独的计费端点，账户余额不足 |
+
+两者是独立的：**抓取能用，关键词检索挂了**。这不影响本设计——agent 可以用任何可用的联网工具，
+只要能把结果整理成 `{title, url, snippet}`。若该宿主的检索能力恢复，检索质量会更好。
+
+也保留一条**全自动路径**（`--search-cmd`），适合已有搜索引擎 API 的场景：
+
+```bash
+# 检索桥：从 stdin 读查询串 → 把 JSON 结果列表写 stdout，每条 {title, url, snippet}
 python discover_conventions.py <raw.csv> --seq-col Sequence \
     --llm-cmd "python llm.py" --search-cmd "python search.py" --emit-rules rules.json
 ```
 
-> ⚠️ **诚实说明**：本次开发会话中，联网检索后端因账户余额不足（HTTP 402）不可用，
-> 因此**外部证据阶段只跑通了离线 mock 路径**（合成 URL、合成片段）。
-> `--search-cmd` 的真实检索链路**未经端到端验证**——接口与防幻觉校验已实现并有单测覆盖，
-> 但"接上真实搜索引擎后能否稳定提取到可靠引用"我没有实测数据，不作宣称。
+> ⚠️ **诚实说明**：本次开发会话中 `web_search` 因余额不可用，
+> 因此**真实关键词检索链路未做端到端验证**：两阶段文件交换模式已完整跑通并有单测覆盖
+> （含 BOM 容忍、字段名兼容、编造引用被拒），离线 mock 检索也已跑通，
+> 但"接上真实搜索引擎后能否稳定提取到可靠引用"我**没有实测数据，不作宣称**。
 
 **离线可复现**：仓库自带 `examples/convention_discovery_demo.csv`（合成，60 行）：
 
@@ -182,7 +227,11 @@ python discover_conventions.py <raw.csv> --seq-col Sequence \
 python discover_conventions.py examples/convention_discovery_demo.csv \
     --seq-col seq_with_markers --ref-col reference_sequence --llm mock
 
-# 无参照列 → 自动转入外部证据检索
+# 无参照列 → 产出待查清单（离线可跑；真实检索需 agent 参与）
+python discover_conventions.py examples/convention_discovery_demo.csv \
+    --seq-col seq_with_markers --llm mock --emit-queries queries.json
+
+# 无参照列 + 离线合成检索（仅用于跑通全流程）
 python discover_conventions.py examples/convention_discovery_demo.csv \
     --seq-col seq_with_markers --llm mock --search mock
 ```
@@ -353,6 +402,12 @@ python validate_model_ready.py cleaned_output/cleaned.csv \
 # 3) 遇到陌生记号：让模型提假设、由代码跑实验判定（离线可跑）
 python discover_conventions.py examples/convention_discovery_demo.csv \
     --seq-col seq_with_markers --ref-col reference_sequence --llm mock
+
+# 3b) 没有参照列时：产出待查清单 → agent 联网检索 → 喂回证据裁定
+python discover_conventions.py <raw.csv> --seq-col Sequence --emit-queries queries.json
+#    （agent 按清单检索后写出 evidence.json）
+python discover_conventions.py <raw.csv> --seq-col Sequence --evidence evidence.json \
+    --emit-rules rules.json
 
 # 4) 寄存器保持量化（同一数据开/关 --align-col 跑两次）
 python benchmark_alignment.py <raw.csv> --align-col Structure

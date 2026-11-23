@@ -181,6 +181,64 @@ check("未查到记载的记号仍为 UNTESTABLE（不硬套）",
 check("外部来源与其原文片段被打印出来",
       "real" not in out4 and "example.invalid" in out4 and "残基未能确定" in out4)
 
+# ------------------------------------------- 两阶段 agent 模式：清单 → 证据 → 裁定
+import tempfile
+
+TMP = tempfile.mkdtemp(prefix="discover_test_")
+QFILE = os.path.join(TMP, "queries.json")
+EFILE = os.path.join(TMP, "evidence.json")
+
+# 第一趟：产出待查清单
+code5, out5 = run_cli([DEMO, "--seq-col", "seq_with_markers", "--llm", "mock",
+                       "--emit-queries", QFILE])
+check("待查清单模式返回 0", code5 == 0)
+check("清单文件已生成", os.path.isfile(QFILE))
+with open(QFILE, encoding="utf-8-sig") as f:
+    manifest = json.load(f)
+check("清单含未解决记号与检索式建议",
+      manifest["unresolved"] and manifest["unresolved"][0]["suggested_queries"])
+check("清单含证据质量规则与回填 schema",
+      "DOCUMENTED" in manifest["evidence_quality_rules"]
+      and "response_schema" in manifest)
+check("清单说明由 agent 执行检索",
+      any("联网" in s for s in manifest["instructions"]))
+
+# 第二趟：agent 写回证据（含 BOM，模拟真实写文件）
+evidence = {
+    "star_bracket_number": {
+        "search_queries": ["marker notation"],
+        "hits": [{"title": "工具文档", "url": "https://real.example/docs#m",
+                  "snippet": "标记 *[k]* 表示该位置原有 k 个残基未能确定，已折叠。"}],
+        # 故意用 text 字段（文档 schema 的写法），验证字段名兼容
+        "claim": {"text": "k 是被折叠的残基数", "source_url": "https://real.example/docs#m",
+                  "supporting_snippet": "标记 *[k]* 表示该位置原有 k 个残基未能确定，已折叠。",
+                  "source_type": "official_docs"},
+    },
+    "lowercase_letters": {
+        "search_queries": ["lowercase"],
+        "hits": [{"title": "无关页", "url": "https://real.example/other",
+                  "snippet": "与本记号无关的内容。"}],
+        "claim": {"text": "小写代表低置信度", "source_url": "https://real.example/other",
+                  "supporting_snippet": "小写代表低置信度", "source_type": "official_docs"},
+    },
+}
+with open(EFILE, "w", encoding="utf-8-sig") as f:
+    json.dump(evidence, f, ensure_ascii=False)
+
+code6, out6 = run_cli([DEMO, "--seq-col", "seq_with_markers", "--llm", "mock",
+                       "--evidence", EFILE])
+body6 = table_part(out6)
+check("证据喂回模式返回 0", code6 == 0)
+check("带 BOM 的证据文件可读（真实写文件常见）", "无法读取" not in out6)
+check("claim.text 字段名被兼容", "DOCUMENTED" in body6)
+check("片段与来源不符的结论被拒", body6.count("UNTESTABLE") >= 1)
+check("引用的真实来源被打印", "real.example/docs#m" in out6)
+
+# 互斥参数
+code7, out7 = run_cli([DEMO, "--seq-col", "seq_with_markers", "--llm", "mock",
+                       "--emit-queries", QFILE, "--evidence", EFILE])
+check("--emit-queries 与 --evidence 互斥报错", code7 == 2)
+
 print()
 if FAILURES:
     raise SystemExit(f"失败 {len(FAILURES)} 项: {FAILURES}")
