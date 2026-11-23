@@ -148,20 +148,18 @@ def main(argv=None):
     print(f"{'方法':<24}{'合法率':>10}{'输出字符数':>14}{'净变化':>14}{'序列保留':>14}")
     print("-" * 90)
     for name, r in stats.items():
-        if r["total"] == 0:
-            valid_s = "—"
-        else:
-            valid_s = f"{100 * r['valid'] / r['total']:.2f}%"
+        # 无输出时合法率未定义（没有字符可查），但"输出 0 个字符、净变化为负"本身是有效信息
+        valid_s = "—" if r["total"] == 0 else f"{100 * r['valid'] / r['total']:.2f}%"
         fully_valid = r["total"] > 0 and r["valid"] == r["total"]
         top = r["total"] > 0 and abs(100 * r["total"] / r["orig"] - best_yield) < 0.05
         note = ""
         if fully_valid and top:
             note = "  ← 既 100% 合法、又留下最多数据"
         elif r["total"] == 0:
-            note = "  ← 整条丢弃，无可用数据"
+            note = "  ← 整条丢弃"
         net = r["total"] - r["orig"]
-        net_s = f"{net:+,}" if r["total"] else "—"
-        total_s = f"{r['total']:,}" if r["total"] else "—"
+        net_s = f"{net:+,}"
+        total_s = f"{r['total']:,}"
         kept_s = f"{r['kept']:,}/{r['rows']:,}"
         print(f"{name:<24}{valid_s:>10}{total_s:>14}{net_s:>14}{kept_s:>14}{note}")
         results[name] = {
@@ -193,6 +191,12 @@ def main(argv=None):
 
 
 def _draw(results, path, label):
+    """画两个独立面板，而不是双 Y 轴柱状图。
+
+    双轴的问题（本图早期版本的真实缺陷）：左轴 0 在底部、右轴范围 0..-5.6e6 时 0 在顶部，
+    两组柱子视觉基线不一致，浅色柱看起来"飘"在轴上；且量级差 3 个数量级时小柱被压成零。
+    拆成两个面板后，每个面板只有一种量纲，注释可以严格贴在各自柱子上。
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -203,41 +207,64 @@ def _draw(results, path, label):
 
     names = ["本仓库规则\n(模型就绪)", "seismic\ncleanfa", "纯 Python\n哑程序", "SNIP\n(蛋白白名单)"]
     keys = ["本仓库规则（模型就绪）", "seismic cleanfa", "纯 Python 哑程序", "SNIP（蛋白白名单）"]
-    valid = [results[k]["valid_rate_pct"] or 0.0 for k in keys]
-    # 图上直接用净变化字符数（比 >100% 的百分比直观，不会被误读成注水）
+    valid = [results[k]["valid_rate_pct"] for k in keys]
     net = [results[k]["net_chars"] for k in keys]
 
     x = np.arange(len(names))
-    w = 0.38
-    fig, ax = plt.subplots(figsize=(10.5, 5.2), dpi=150)
-    ax2 = ax.twinx()
-    b1 = ax.bar(x - w / 2, valid, w, label="输出合法率（%，左轴）", color="#2171b5")
-    b2 = ax2.bar(x + w / 2, net, w, label="字符净变化（相对输入，右轴）", color="#9ecae1")
-    for bar in b1:
-        v = bar.get_height()
-        ax.annotate(f"{v:.1f}%", (bar.get_x() + bar.get_width() / 2, v),
-                    xytext=(0, 3), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=9)
-    for bar in b2:
-        v = bar.get_height()
-        ax2.annotate(f"{v:+,}", (bar.get_x() + bar.get_width() / 2, v),
-                     xytext=(0, 3 if v >= 0 else -12), textcoords="offset points",
-                     ha="center", va="bottom", fontsize=9)
-    ax.set_ylabel("输出合法率（%）")
-    ax2.set_ylabel("字符净变化")
-    ax.set_ylim(0, 118)
-    ax.set_xticks(x)
-    ax.set_xticklabels(names, fontsize=9)
-    ax.set_title(f"清理输出能否直接训练（基于{label}，未随仓库提供）", fontsize=12)
-    h1, l1 = ax.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, loc="lower left", fontsize=9, framealpha=0.95)
-    ax.grid(axis="y", linestyle="--", alpha=0.35)
-    ax.spines["top"].set_visible(False)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.2), dpi=150)
+
+    # ---------- 面板①：输出合法率 ----------
+    bars1 = ax1.bar(x, [0 if v is None else v for v in valid], 0.58, color="#2171b5")
+    for bar, v in zip(bars1, valid):
+        cx = bar.get_x() + bar.get_width() / 2   # 严格取柱子中心
+        if v is None:
+            ax1.annotate("无输出\n(无数可查)", (cx, 0), xytext=(0, 4),
+                         textcoords="offset points", ha="center", va="bottom",
+                         fontsize=8.5, color="#a63603")
+        else:
+            ax1.annotate(f"{v:.1f}%", (cx, v), xytext=(0, 3),
+                         textcoords="offset points", ha="center", va="bottom",
+                         fontsize=9.5)
+    ax1.axhline(100, color="#969696", linestyle="--", linewidth=0.9)
+    ax1.set_ylim(0, 118)
+    ax1.set_ylabel("输出合法率（%）")
+    ax1.set_title("① 输出合法率：字符能否进模型输入口", fontsize=11)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(names, fontsize=9)
+    ax1.grid(axis="y", linestyle="--", alpha=0.3)
+    ax1.spines["top"].set_visible(False)
+    ax1.spines["right"].set_visible(False)
+
+    # ---------- 面板②：字符净变化 ----------
+    colors = ["#2171b5" if v >= 0 else "#e6550d" for v in net]
+    bars2 = ax2.bar(x, net, 0.58, color=colors)
+    ax2.axhline(0, color="#333333", linewidth=1.1)
+    for bar, v in zip(bars2, net):
+        cx = bar.get_x() + bar.get_width() / 2
+        if v >= 0:
+            ax2.annotate(f"{v:+,}", (cx, v), xytext=(0, 3), textcoords="offset points",
+                         ha="center", va="bottom", fontsize=9.5)
+        else:
+            # 负柱向下延伸，标签放在柱底之下，同样居中
+            ax2.annotate(f"{v:+,}", (cx, v), xytext=(0, -4), textcoords="offset points",
+                         ha="center", va="top", fontsize=9.5)
+    ax2.set_ylabel("字符净变化（输出字符数 − 输入字符数）")
+    ax2.set_title("② 字符净变化：保留了多少可用数据", fontsize=11)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(names, fontsize=9)
+    ax2.grid(axis="y", linestyle="--", alpha=0.3)
     ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
+
+    # 给最下方的负柱留出标注空间
+    lo = min(net + [0])
+    ax2.set_ylim(lo * 1.18 if lo < 0 else -1, max(net + [0]) * 1.25 + 1)
+
+    fig.suptitle(f"清理输出能否直接训练（基于{label}，未随仓库提供）", fontsize=12.5, y=1.0)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    plt.tight_layout()
     plt.savefig(path, bbox_inches="tight")
+    plt.close(fig)
     print(f"图已写入: {path}")
 
 
