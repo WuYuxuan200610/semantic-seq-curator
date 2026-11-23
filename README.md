@@ -416,7 +416,7 @@ python benchmark_model_ready.py <raw.csv> --seq-col Sequence --chart benchmark/m
 ### 获取
 
 ```bash
-git clone https://github.com/<你的用户名>/semantic-seq-curator.git
+git clone https://github.com/WuYuxuan200610/semantic-seq-curator.git
 cd semantic-seq-curator
 ```
 
