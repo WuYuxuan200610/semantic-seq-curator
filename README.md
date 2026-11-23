@@ -1,116 +1,118 @@
 # semantic-seq-curator
 
-把生物序列清洗成**能直接进语言模型输入口**的数据：输出保证只含目标字母表内的字符，
-并把每个非标准字符的"原来是什么 → 变成什么 → 为什么"逐条记录下来。
+把生物序列变成**模型可读、可验证、可审计**的训练输入。
 
-> **这个仓库是什么**：一个做完了、验证过、但不打算继续投入的**原型**。
-> **它不是什么**：不是新工具。请先读下面的"诚实定位"，再决定要不要用。
-
----
-
-## 诚实定位（先说这个）
-
-**核心功能是重复造轮子。** "把非标准字符映射进固定字母表"这件事，已有实现包括但不限于：
-
-- `seqkit replace -p '[^ACGT]' -r N`（一行命令）
-- Biopython `SeqIO` + 一张转换表（十几行）
-- **seismic cleanfa** 已经做了 IUPAC 模糊码 → N
-- 几乎每个 ML 数据管线都自带一个几十行的 normalize 函数
-
-本仓库的核心逻辑量级也在这个水平。所以：**如果你的需求只是"把乱码换成 N"，直接用上面任何一个，不要用这个仓库。**
-
-那这个仓库为什么还存在？只有一个理由：
-
-> **它记录了"如何用实证方法确定一个未知的数据格式约定"，以及一个真实的踩坑教训。**
-
-具体是下面这件事。
+一句话定位：**不只是"把乱码换成 N"，而是给"清洗"这件事补上一份可执行的契约**——
+先声明目标词表，再逐字符映射，运行内自检，最后用一份**不复用清理代码**的独立脚本复核；
+每个字符的变换都作为数据导出，可逐条复查。
 
 ---
 
-## 唯一可能有点价值的部分：如何判定 `*[k]*` 的含义
+## 一、为什么是"契约"而不是"又一个替换脚本"
 
-有些上游工具会把无法处理的碱基替换成 `*[k]*` 这样的占位标记。问题是：
+大多数序列清洗的产物是**一条干净的序列**，你无从知道它被改了什么。本项目的产物是
+**序列 + 变换账本 + 合法性证明**三件套。具体做成了五件事：
 
-- 如果 **k = 丢失了 k 个碱基**（计数）→ 应该还原成 `k` 个 `N`，长度回到真实值，才能训练；
-- 如果 **k = 第 k 号标记**（编号）→ 标记只是注解，长度不该变。
+### 1. 合法性是一个被证明的断言，不是口头承诺
 
-**光看数据本身判断不了。** 而且这里有一个很隐蔽的陷阱：
+清理时逐行断言，产物写完后**再独立复查一遍**：
 
-我最初用一个看起来很有力的判据——同一行的**结构注释列**里，该位置的 `~` 个数恰好等于标记的文本宽度
-（`*[19]*` 宽 6 字符，那里正好 6 个 `~`），于是误判为"长度就是标记宽度、不该展开"。
+- `curate.py` 运行内检查每个输出字符是否 ∈ 目标字母表；
+- [`validate_model_ready.py`](validate_model_ready.py) **故意重新实现一遍字母表定义**，
+  不 import 清理代码，重新读产物逐字符复核，并统计"出现过的禁用字符集合"。
 
-**这个判据是循环证据**：结构注释列是从**已经损坏**的序列算出来的，它反映的是损坏后的状态，
-不能用来推断损坏前有多少碱基。
+> 验证器与被验证对象共享实现，验证就没有意义。所以这份验证器是**独立副本**。
 
-**正确做法**：找一个**未被污染**的参照列（例如同一位点的原始序列提取结果），
-取占位符两侧各 15bp 作锚点，在参照列里定位，量出两锚点之间的**真实跨度**。
+只要有一个字符不在词表里，它就喂不进模型——这条检查保证这件事不会静默发生。
 
-[`verify_placeholder_semantics.py`](verify_placeholder_semantics.py) 就是这个方法的可复用实现：
+### 2. 每个字符的变换都可导出、可追查
+
+产物里每个序列列都带一列 `<列名>_curation_summary`（逐行 JSON）和列级映射直方图：
+
+```json
+{"column": "rna_seq", "sequence_type": "rna", "target_alphabet": "rna",
+ "original_length": 30, "curated_length": 26,
+ "mapping": {"小写→大写": 4, "gap→fallback": 1, "占位符→fallback×k": 1}}
+```
+
+"哪一列、改了多少个、改成什么"，全部是机器可读的数据，而不是隐藏在实现里。
+清理出问题时可定位到具体行、具体映射项。
+
+### 3. 寄存器保持：序列和注释列一起动，不许错位
+
+这是本项目与"单列文本替换"最实质的区别。
+
+序列和它的注释（二级结构、比对串、位置索引）必须逐位对齐。一旦某个变换**会改变长度**
+（比如占位符还原成 `k` 个 `N`），只改序列就会让注释整体错位——而这种错位是静默的，
+下游不会报错，只会训出坏模型。
+
+所以 `--align-col` 把注释列纳入同一次变换：同一条规则、同一个位置映射，同步改写。
+并且：**无法证明两列原本对齐时不会硬猜**——配对失败直接报错停止；
+个别行长度不一致则跳过该列并在该行记录原因。
 
 ```bash
-# 仓库里带了一个**合成**样例，可直接跑通看效果（不涉及任何真实数据）
+python curate.py data.csv --align-col Structure              # 自动配对
+python curate.py data.csv --align-col rna_seq=structure      # 显式指定配对
+```
+
+### 4. 失败即拒绝，不静默猜
+
+清洗最危险的失败不是报错，而是**悄悄猜错**。因此以下情况一律停止并给出可操作的提示：
+
+| 情况 | 行为 |
+|---|---|
+| 显式指定的列名不存在 | 报错，列出可用字段，**不写出任何结果** |
+| 自动检测不到可信序列列 | 报错并提示用 `--seq-col` 指定，**不写出任何结果** |
+| 注释列无法与任何序列列配对 | 报错并提示用 `序列列=注释列` 显式配对 |
+| 注释列与序列原始长度不一致 | 跳过该列并记录原因，**不冒险做位置映射** |
+| 输出出现字母表外字符 | 复核失败，退出码非 0 |
+
+### 5. 未知的数据约定，用实证而不是猜测定下来
+
+上游工具可能留下 `*[k]*` 这类占位标记，而 `k` 的含义**决定了整个处理方式**。
+本仓库把"如何定这件事"做成了一个可复用脚本：
+[`verify_placeholder_semantics.py`](verify_placeholder_semantics.py)
+——取占位符两侧锚点，在**未被污染的参照列**里量出真实跨度，直接判定 `k` 是计数还是编号。
+
+```bash
+# 仓库自带合成样例，可直接跑通
 python verify_placeholder_semantics.py examples/placeholder_anchor_demo.csv \
     --seq-col seq_with_placeholder --ref-col reference_sequence --flank 15
 # → 真实跨度 == k : 3/3 = 100.00%
 # → 真实跨度 == 标记宽度 : 3/3 = 0.00%
-
-# 用你自己的数据
-python verify_placeholder_semantics.py <raw.csv> \
-    --seq-col Sequence --ref-col FASTA_sequence --flank 15
 ```
 
-它输出"真实跨度 == k"与"真实跨度 == 标记宽度"两个比例，直接给出结论。
-
-在一份本地原始数据上跑出来的结果：**真实跨度 == k 的比例为 100%，== 标记宽度为 0%**
-（2168 个可锚定样本；`--flank 10` 时因锚点太短误匹配出现 3/2967 偏差，加长到 15 即消除——
-这也是一个值得记住的教训：**锚点必须足够长，否则会匹配到错误位置**）。
-
-结论：`*[k]*` 应还原为 `k` 个 `N`。这个结论**只对该数据集成立**，不要当成通用规律——
-换一份数据，请重新跑一次上面的脚本。
+这里有一条不容易想到、但代价很高的坑：**从已损坏数据派生出的注释列是循环证据**。
+本项目的结构注释列曾经"恰好"显示占位区域的宽度等于标记文本宽度，差点让人得出错误结论——
+它反映的是损坏后的状态，永远不能用来推断损坏前有多少内容。上面这个方法就是在纠正它。
 
 ---
 
-## 目标字母表驱动的清理
+## 二、与邻近工具的差别
 
-如果确认了约定，清理本身很简单。工具强制的是：**先声明词表，再保证输出 100% 合法。**
+这些工具都很成熟，本项目不是它们的替代品，而是在它们没有覆盖的位置上工作：
 
-```bash
-python curate.py <sequences.csv>                        # 自动检测序列列
-python curate.py <sequences.csv> --alphabet rna          # 指定模型词表
-python curate.py <sequences.csv> --align-col Structure   # 同步还原对齐的注释列
-python curate.py <sequences.csv> --gaps drop             # 删除 gap 而非映射为 N
-```
+| 能力 | seqkit / cleanfa / SNIP 等 | 本项目 |
+|---|---|---|
+| 字母表规范化 | ✅ 成熟、快、生态好 | ✅ 同样支持 |
+| 目标词表可切换 | cleanfa 面向核酸、SNIP 面向蛋白，各自固定 | **同一入口覆盖核酸 + 蛋白**，`dna` / `rna` / `nucleic-mixed` / `dna-iupac` / `protein` / `protein-extended` 随 tokenizer 切换 |
+| 词表支持模糊码时保留信息 | 通常不具备 | `--alphabet dna-iupac` **原样保留** R/Y/W/… 而不是丢弃 |
+| 变换账本（改了什么、为什么） | 一般只给结果或计数 | **逐行 JSON + 列级直方图**，可导出复查 |
+| 独立复核脚本 | 罕见 | **刻意不复用实现**的验证器 |
+| 注释列寄存器保持 | 不在其职责内 | `--align-col` 同步变换；无法证明对齐则拒绝 |
+| 静默猜错防护 | 视工具而定 | 列/类型/配对不确定一律停止，**不写结果** |
+| 未知约定实证 | 不涉及 | 锚定法脚本 + 合成演示样例 |
 
-内置字母表：
+补充两点实际影响：
 
-| 档案 | 允许字符 |
-|---|---|
-| `dna` | A C G T N |
-| `rna` | A C G U N |
-| `nucleic-mixed` | A C G T U N |
-| `dna-iupac` / `rna-iupac` | 标准碱基 + 全部 IUPAC 模糊码 + N |
-| `protein` | 20 种标准氨基酸 + X |
-| `protein-extended` | 20 + X + B Z J U O * |
-| `auto`（默认） | 按每行推断的类型自动选择 |
-
-映射规则：
-
-| 输入 | 处理 |
-|---|---|
-| 小写 `acgu` | → 大写 |
-| IUPAC 模糊码 `R Y W S K M …` | → `N`（严格字母表下）；`-iupac` 档案则原样保留 |
-| gap `-` `.` | → `N`（默认，保持对齐）或 `--gaps drop` |
-| 占位符 `*[k]*` | → `k` 个 `N`（前提是你已按上面的方法确认了 k 的含义） |
-| 其它未知字符 | → `N`/`X`（默认）或 `--unknown drop` |
-
-**必须说清楚**：严格字母表下把 IUPAC 模糊码映射为 `N`，**与 seismic cleanfa 的选择完全相同**——
-对固定词表而言这是唯一正确的做法。所以这一点**不构成本仓库的任何优势**。
-本仓库相对 cleanfa 的实际差别只有三点：① 输出保证 100% 合法并有独立复核脚本；
-② 占位符按计数还原，把 cleanfa 会丢弃的长度补回来；③ 映射逐条记录、字母表可切换。
+- **数据产出**：占位符按计数还原后，cleanfa 与朴素删除脚本会丢失的那部分长度被补了回来
+  （见下方结果图的"数据产出"一栏，100.2% vs 93.5%）。
+- **工具用错域会静默清零数据**：把蛋白白名单工具用在核酸数据上会把序列整条删光。
+  这类"结果为空但不报错"的情形，正是上面第 4 条防护要拦的。
 
 ---
 
-## 结果
+## 三、结果
 
 下图基于一份**本地原始数据**（未随仓库提供）生成。你可用自己的数据复现：
 
@@ -122,40 +124,63 @@ python benchmark_model_ready.py <raw.csv> --seq-col Sequence --chart benchmark/m
 
 | 方法 | 输出合法率 | 数据产出 | 序列保留 |
 |---|---|---|---|
-| 本仓库规则 | 100.00% | 100.2% | 全部 |
+| 本项目规则 | 100.00% | **100.2%** | 全部 |
 | seismic cleanfa | 100.00% | 93.5% | 全部 |
-| 纯 Python 哑程序 | 100.00% | 93.5% | 全部 |
+| 朴素删除脚本 | 100.00% | 93.5% | 全部 |
 | SNIP（蛋白白名单） | — | — | **0** |
 
 - **合法率**：输出字符 ∈ 目标字母表 的比例。<100% 就意味着有字符喂不进模型。
-- **数据产出**：输出字符数 / 原始字符数。本仓库 >100% 是因为占位符被还原为缺失的碱基。
-- SNIP 是蛋白工具（白名单仅 20 种氨基酸），用在核酸数据上会整条删光——**这提醒我们：工具用错域会静默清零数据。**
+- **数据产出**：输出字符数 / 原始字符数。本项目 >100% 是因为占位符被还原为缺失的碱基，
+  这部分长度在另外两种输出里是丢失的。
 
-另一张图（[benchmark/comparison.png](benchmark/comparison.png)）是在**合成用例**上对
-语义判断正确性的对比，与真实数据无关。
+另一张图（[benchmark/comparison.png](benchmark/comparison.png)）是在**合成用例**上
+对语义判断正确性的对比，与真实数据无关。
 
 ---
 
-## 快速开始
+## 四、快速开始
 
 ```bash
-# 1) 清理（保证输出 100% 在目标字母表内）
+# 1) 清理（自动检测序列列；输出保证 100% 在目标字母表内）
 python curate.py <sequences.csv> --out cleaned_output
 
-# 2) 独立复核（故意不复用清理代码，重新读一遍成品逐字符检查）
-python validate_model_ready.py cleaned_output/cleaned.csv --align-col rna_seq=structure_curated
+# 2) 独立复核（不复用清理代码，重新逐字符检查产物）
+python validate_model_ready.py cleaned_output/cleaned.csv \
+    --align-col rna_seq=structure_curated
 
-# 3) 确认未知占位约定的含义（换数据先跑这个；仓库自带合成样例）
-python verify_placeholder_semantics.py examples/placeholder_anchor_demo.csv \
-    --seq-col seq_with_placeholder --ref-col reference_sequence --flank 15
+# 3) 遇到未知的占位约定，先实证再处理
+python verify_placeholder_semantics.py <raw.csv> \
+    --seq-col Sequence --ref-col FASTA_sequence --flank 15
 
 # 4) 自检
 python test_curate_entry.py    # 入口回归（含"全表无字母表外字符"断言）
-python test_agent.py           # Agent 组件回归
+python test_agent.py           # 语义分类组件回归
 python run_demo.py             # 合成用例：同一字符在不同上下文得到不同决策
 ```
 
 依赖：仅标准库。画图需要 `matplotlib`（可选）。
+
+### 目标字母表
+
+| 档案 | 允许字符 | 适用 |
+|---|---|---|
+| `dna` | A C G T N | DNA 语言模型 |
+| `rna` | A C G U N | RNA 语言模型 |
+| `nucleic-mixed` | A C G T U N | 不能确定 DNA/RNA 时 |
+| `dna-iupac` / `rna-iupac` | 标准碱基 + 全部 IUPAC 模糊码 + N | tokenizer 支持模糊码时**保留信息** |
+| `protein` | 20 种标准氨基酸 + X | 严格蛋白词表 |
+| `protein-extended` | 20 + X + B Z J U O * | ESM 类词表 |
+| `auto`（默认） | 按行推断类型自动选择 | 通用 |
+
+### 映射规则
+
+| 输入 | 处理 |
+|---|---|
+| 小写 `acgu` | → 大写 |
+| IUPAC 模糊码 `R Y W S K M …` | → `N`；`-iupac` 档案则原样保留 |
+| gap `-` `.` | → `N`（默认，保持对齐）或 `--gaps drop` |
+| 占位符 `*[k]*` | → `k` 个 `N`（前提：已用锚定法确认 `k` 的含义） |
+| 其它未知字符 | → `N`/`X`（默认）或 `--unknown drop` |
 
 ### 作为库使用
 
@@ -168,62 +193,64 @@ cleaned, mapping, seq_type, alphabet = clean_sequence("ACGTNacgt-*[ 2]*", alphab
 
 ---
 
-## 目录结构
+## 五、架构
 
 ```
-curate.py                      清理主入口（字母表驱动 + 100% 合法性保证）
-validate_model_ready.py        独立复核产物合法性
-verify_placeholder_semantics.py 实证未知占位约定的含义（本仓库最有用的一段）
-benchmark_model_ready.py       合法率 / 数据产出 对比 + 画图
-benchmark.py                   合成用例上的语义判断对比
-draw_chart.py                  画上面对比的图
-semantic_seq_curator/          可选增强层：IUPAC 知识表、工具注册表、Reasoner、ReAct 循环
-                                （注意：这一层是架构脚手架，不是本仓库的卖点）
-test_curate_entry.py           入口回归测试
-test_agent.py                  Agent 组件回归测试
-run_demo.py                    合成用例演示
-docs/RESEARCH.md               竞品调研（9 个工具的实际行为核实，含链接）
-docs/COMPETITIVE_ADVANTAGE.md  竞品共性 vs 本仓库差异（含"哪些不算差异"的说明）
-docs/SKILL.md                  以 DSH Skill 形式描述同一套流程
-docs/AGENT.md                  Agent 顶层提示词（System Prompt）
-examples/mixed_case.fasta      合成测试序列
-examples/example_sequences.csv 合成多列 CSV（可直接跑 curate.py）
-examples/placeholder_anchor_demo.csv 占位符锚定方法的合成演示样例
-benchmark/                     对比结果 JSON 与图
+curate.py                       清理主入口（字母表驱动 + 运行内合法性断言）
+validate_model_ready.py         独立复核器（刻意不复用清理实现）
+verify_placeholder_semantics.py 未知占位约定的实证方法（含合成演示样例）
+benchmark_model_ready.py        合法率 / 数据产出 对比 + 画图
+benchmark.py / draw_chart.py    合成用例上的语义判断对比与绘图
+semantic_seq_curator/           语义分类内核
+  ├─ iupac.py                   IUPAC 映射表、修饰表、保守基序库
+  ├─ downstream.py              下游任务 schema（词表容忍度与标签要求）
+  ├─ tools.py                   Tool 抽象 + 工具注册表
+  ├─ agent.py                   Reasoner（规则 / LLM 可插拔）+ ReAct 循环
+  └─ autonomous.py              由 LLM 面对原始序列自主发现语义 + 规则沉淀
+test_curate_entry.py            入口回归测试
+test_agent.py                   语义分类组件回归测试
+run_demo.py                     合成用例演示
+docs/                           竞品调研、差异说明、Skill 定义、System Prompt
+examples/                       合成数据（可直接跑通全部脚本）
+benchmark/                      对比结果与图
 ```
+
+**分层设计**：规则引擎是主体，可独立完成全部清理（默认路径、零外部依赖、可离线规模化）。
+`Reasoner` 是接口，`RuleReasoner`（确定性、可单测）与 `LLMReasoner`（注入任意大模型）
+可互换——需要让模型参与长尾判断时替换推理器即可，清理主链路不变。
 
 ---
 
-## 相关工具（本仓库与它们重叠，优先用它们）
+## 六、边界与已知限制
 
-| 工具 | 做什么 | 链接 |
-|---|---|---|
-| seqkit | 序列工具集，`replace`/`seq` 子命令可直接做字母表规范化 | [shenwei356/seqkit](https://github.com/shenwei356/seqkit) |
-| seismic cleanfa | FASTA 规范：模糊码 → N | [rouskinlab/seismic-rna](https://github.com/rouskinlab/seismic-rna) |
-| Biopython | `SeqIO` / `Seq` 基础读写与转换 | [biopython/biopython](https://github.com/biopython/biopython) |
-| ShortRead (Bioconductor) | 短读过滤，含 `clean()` 移除含模糊碱基的读 | [Bioconductor/ShortRead](https://github.com/Bioconductor/ShortRead) |
-| SNIP | 按 20 种标准氨基酸白名单整条剔除序列 | [BBCMdP/SNIP](https://github.com/BBCMdP/SNIP) |
-| bio-rs | 逐位符号级校验与 tokenization | [bio-rs/bio-rs](https://github.com/bio-rs/bio-rs) |
-| data-labelling | agentic 元数据标注（rationale + confidence + review_queue） | [nextflow-io/nextflow](https://github.com/nextflow-io/nextflow/tree/master/examples/agents/14_data-labelling) |
+写清楚边界，比假装没有边界更有用：
 
-详细的竞品行为核实见 [docs/RESEARCH.md](docs/RESEARCH.md)。
-
-**借鉴来源**：`data-labelling` 的可审计标注结构（rationale + confidence + 人工复核队列）；
-`bio-rs` 的逐位符号级诊断思路；`dsh-bio-genie` 的序列类型自动判断思路；
-`seismic cleanfa` 的"模糊码 → N"处理范式；IUPAC-IUB 标准（Cornish-Bowden 1985, *NAR* 13:3021）。
-
----
-
-## 已知局限
-
-1. **未验证跨数据集泛化。** 占位符 `/gap / 小写` 的约定都是**按数据集**确认的，换数据必须重新验证。
+1. **约定必须按数据集确认。** 占位符 / gap / 大小写的含义是**逐数据集**的约定，
+   换数据请先跑 `verify_placeholder_semantics.py`，不要把某个数据集的结论当通用规律。
 2. **占位符只能还原长度，不能还原身份。** `*[k]*` → `k` 个 `N`，原来的碱基是什么**不可知**；
-   `N` 只表达"未知"，不是"已知是 N"。
-3. **`gap → N` 是编码选择，不是生物学结论。** gap 表示相对比对缺失，不是"未知碱基"。
-   要真正的去比对形式，用 `--gaps drop`（长度会变，注释列需重新对齐）。
-4. **`semantic_seq_curator/` 那一层是脚手架。** 工具注册表 / Reasoner / ReAct 循环是架构包装，
-   没有带来超出规则引擎的能力。列在这里是为了完整，不是推荐使用。
-5. **严格字母表下模糊码 → N 与 cleanfa 相同**，不算差异（见上文）。
+   `N` 表达"未知"，不是"已知是 N"。
+3. **`gap → N` 是编码选择，不是生物学结论。** gap 表示相对比对缺失。若要真正的去比对形式，
+   用 `--gaps drop`（长度会变，注释列需重新对齐）。
+4. **尚未做跨数据集泛化验证。** 现有验证集中于合成用例与一份本地数据。
+5. **`LLMReasoner` / `autonomous.py` 需要外部模型后端**才能发挥；默认路径不依赖它们。
+
+---
+
+## 七、相关工作与致谢
+
+| 工具 | 做什么 |
+|---|---|
+| [seqkit](https://github.com/shenwei356/seqkit) | 序列工具集，覆盖格式转换与字母表规范化 |
+| [seismic cleanfa](https://github.com/rouskinlab/seismic-rna) | FASTA 规范：模糊码 → N |
+| [Biopython](https://github.com/biopython/biopython) | 序列读写与转换基础库 |
+| [ShortRead](https://github.com/Bioconductor/ShortRead) | 短读过滤（Bioconductor） |
+| [SNIP](https://github.com/BBCMdP/SNIP) | 按 20 种标准氨基酸白名单整条剔除 |
+| [bio-rs](https://github.com/bio-rs/bio-rs) | 逐位符号级校验与 tokenization |
+| [data-labelling](https://github.com/nextflow-io/nextflow/tree/master/examples/agents/14_data-labelling) | agentic 元数据标注（rationale + confidence + 复核队列） |
+
+借鉴来源：`data-labelling` 的可审计标注结构；`bio-rs` 的逐位符号级诊断思路；
+`dsh-bio-genie` 的序列类型自动判断思路；IUPAC-IUB 标准（Cornish-Bowden 1985, *NAR* 13:3021）。
+详细的竞品行为核实见 [docs/RESEARCH.md](docs/RESEARCH.md)。
 
 ## License
 
