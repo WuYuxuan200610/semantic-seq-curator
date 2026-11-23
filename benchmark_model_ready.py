@@ -193,9 +193,15 @@ def main(argv=None):
 def _draw(results, path, label):
     """画两个独立面板，而不是双 Y 轴柱状图。
 
-    双轴的问题（本图早期版本的真实缺陷）：左轴 0 在底部、右轴范围 0..-5.6e6 时 0 在顶部，
-    两组柱子视觉基线不一致，浅色柱看起来"飘"在轴上；且量级差 3 个数量级时小柱被压成零。
-    拆成两个面板后，每个面板只有一种量纲，注释可以严格贴在各自柱子上。
+    两个刻意的决定：
+
+    1. 拆成两个面板而非双轴。双轴的问题：左轴 0 在底部、右轴范围 0..-5.6e6 时 0 在顶部，
+       两组柱子视觉基线不一致，浅色柱看起来"飘"在轴上；量级差 3 个数量级时小柱被压成零。
+       拆开后每个面板只有一种量纲，注释可严格贴在各自柱子上。
+
+    2. 图里只比较"正常清洗工具"，SNIP 用脚注说明。SNIP 是把蛋白白名单工具用在核酸数据上，
+       结果是整条清零——这是**性质不同**的结果，不是同一量纲上的极端值。
+       混在一张图里，它的 -5.6e6 会把另外三根柱子压成不可见（本图早期版本的真实问题）。
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -205,63 +211,71 @@ def _draw(results, path, label):
     matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
     matplotlib.rcParams["axes.unicode_minus"] = False
 
-    names = ["本仓库规则\n(模型就绪)", "seismic\ncleanfa", "纯 Python\n哑程序", "SNIP\n(蛋白白名单)"]
-    keys = ["本仓库规则（模型就绪）", "seismic cleanfa", "纯 Python 哑程序", "SNIP（蛋白白名单）"]
-    valid = [results[k]["valid_rate_pct"] for k in keys]
-    net = [results[k]["net_chars"] for k in keys]
+    snip_key = "SNIP（蛋白白名单）"
+    chart_keys = [k for k in ("本仓库规则（模型就绪）", "seismic cleanfa", "纯 Python 哑程序")
+                  if k in results]
+    chart_names = {
+        "本仓库规则（模型就绪）": "本仓库规则\n(模型就绪)",
+        "seismic cleanfa": "seismic\ncleanfa",
+        "纯 Python 哑程序": "纯 Python\n哑程序",
+    }
+    names = [chart_names[k] for k in chart_keys]
+    valid = [results[k]["valid_rate_pct"] for k in chart_keys]
+    net = [results[k]["net_chars"] for k in chart_keys]
+    snip = results.get(snip_key)
 
-    x = np.arange(len(names))
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.2), dpi=150)
+    x = np.arange(len(chart_keys))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 5.0), dpi=150)
 
     # ---------- 面板①：输出合法率 ----------
-    bars1 = ax1.bar(x, [0 if v is None else v for v in valid], 0.58, color="#2171b5")
+    bars1 = ax1.bar(x, [0 if v is None else v for v in valid], 0.55, color="#2171b5")
     for bar, v in zip(bars1, valid):
         cx = bar.get_x() + bar.get_width() / 2   # 严格取柱子中心
-        if v is None:
-            ax1.annotate("无输出\n(无数可查)", (cx, 0), xytext=(0, 4),
-                         textcoords="offset points", ha="center", va="bottom",
-                         fontsize=8.5, color="#a63603")
-        else:
-            ax1.annotate(f"{v:.1f}%", (cx, v), xytext=(0, 3),
-                         textcoords="offset points", ha="center", va="bottom",
-                         fontsize=9.5)
+        ax1.annotate("—" if v is None else f"{v:.1f}%",
+                     (cx, 0 if v is None else v), xytext=(0, 3),
+                     textcoords="offset points", ha="center", va="bottom", fontsize=10)
     ax1.axhline(100, color="#969696", linestyle="--", linewidth=0.9)
     ax1.set_ylim(0, 118)
     ax1.set_ylabel("输出合法率（%）")
     ax1.set_title("① 输出合法率：字符能否进模型输入口", fontsize=11)
     ax1.set_xticks(x)
-    ax1.set_xticklabels(names, fontsize=9)
+    ax1.set_xticklabels(names, fontsize=9.5)
     ax1.grid(axis="y", linestyle="--", alpha=0.3)
     ax1.spines["top"].set_visible(False)
     ax1.spines["right"].set_visible(False)
 
     # ---------- 面板②：字符净变化 ----------
     colors = ["#2171b5" if v >= 0 else "#e6550d" for v in net]
-    bars2 = ax2.bar(x, net, 0.58, color=colors)
+    bars2 = ax2.bar(x, net, 0.55, color=colors)
     ax2.axhline(0, color="#333333", linewidth=1.1)
     for bar, v in zip(bars2, net):
         cx = bar.get_x() + bar.get_width() / 2
         if v >= 0:
             ax2.annotate(f"{v:+,}", (cx, v), xytext=(0, 3), textcoords="offset points",
-                         ha="center", va="bottom", fontsize=9.5)
+                         ha="center", va="bottom", fontsize=10)
         else:
-            # 负柱向下延伸，标签放在柱底之下，同样居中
+            # 负柱向下延伸，标签置于柱底之下，同样居中
             ax2.annotate(f"{v:+,}", (cx, v), xytext=(0, -4), textcoords="offset points",
-                         ha="center", va="top", fontsize=9.5)
+                         ha="center", va="top", fontsize=10)
+    hi, lo = max(net + [0]), min(net + [0])
+    ax2.set_ylim(lo * 1.25, hi * 1.45 + 1)
     ax2.set_ylabel("字符净变化（输出字符数 − 输入字符数）")
     ax2.set_title("② 字符净变化：保留了多少可用数据", fontsize=11)
     ax2.set_xticks(x)
-    ax2.set_xticklabels(names, fontsize=9)
+    ax2.set_xticklabels(names, fontsize=9.5)
     ax2.grid(axis="y", linestyle="--", alpha=0.3)
     ax2.spines["top"].set_visible(False)
     ax2.spines["right"].set_visible(False)
 
-    # 给最下方的负柱留出标注空间
-    lo = min(net + [0])
-    ax2.set_ylim(lo * 1.18 if lo < 0 else -1, max(net + [0]) * 1.25 + 1)
-
-    fig.suptitle(f"清理输出能否直接训练（基于{label}，未随仓库提供）", fontsize=12.5, y=1.0)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.suptitle(f"清理输出能否直接训练（基于{label}，未随仓库提供）", fontsize=12.5, y=1.02)
+    if snip:
+        fig.text(
+            0.5, -0.04,
+            f"注：SNIP（把蛋白白名单工具用于核酸数据）输出 0 个字符、净变化 "
+            f"{snip['net_chars']:+,}，全部数据被删除。因其为整条清零、性质不同，"
+            f"未纳入同轴比较。",
+            ha="center", fontsize=9, color="#a63603", wrap=True)
+    fig.tight_layout()
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     plt.savefig(path, bbox_inches="tight")
     plt.close(fig)
