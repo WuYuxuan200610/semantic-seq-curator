@@ -255,8 +255,8 @@ python discover_conventions.py examples/convention_discovery_demo.csv \
 补充两点实际影响：
 
 - **数据产出**：占位符按计数还原后，cleanfa 与朴素删除脚本会丢失的那部分长度被补了回来
-  （实测 100.2% vs 93.5%，见 §3.5）。
-- **注释列寄存器保持**：不做同步时实测约 21.7% 的行会序列/注释错位（见 §3.3）。
+  （实测字符净变化 **+8,731** vs **−367,530**，见 §4.5）。
+- **注释列寄存器保持**：不做同步时实测约 21.7% 的行会序列/注释错位（见 §4.3）。
 - **工具用错域会静默清零数据**：把蛋白白名单工具用在核酸数据上会把序列整条删光。
   这类"结果为空但不报错"的情形，正是上面第 4 条防护要拦的。
 
@@ -267,7 +267,7 @@ python discover_conventions.py examples/convention_discovery_demo.csv \
 以下全部数字来自**一份本地原始数据**（未随仓库提供，故只给数值与复现命令）。
 每组实验都可用你自己的数据复跑。
 
-### 3.1 清理与独立复核的规模
+### 4.1 清理与独立复核的规模
 
 `curate.py` 自检 + `validate_model_ready.py`（不复用实现的独立副本）复核：
 
@@ -285,7 +285,7 @@ python curate.py <raw.csv> --align-col Structure --out out
 python validate_model_ready.py out/cleaned.csv --align-col Sequence=Structure_curated
 ```
 
-### 3.2 变换账本（机器可读、逐行可查）
+### 4.2 变换账本（机器可读、逐行可查）
 
 同一份数据上，每一个被改动的字符都被计数，并可下钻到具体行：
 
@@ -300,7 +300,7 @@ python validate_model_ready.py out/cleaned.csv --align-col Sequence=Structure_cu
 这正是"清洗"变成"契约"的地方：**改了多少、改成什么，是产物的一部分**，
 而不是隐藏在实现里。逐行明细在每行的 `<列名>_curation_summary`，列级汇总在同名 JSON。
 
-### 3.3 寄存器保持：不做同步会错位多少？（A/B 实验）
+### 4.3 寄存器保持：不做同步会错位多少？（A/B 实验）
 
 同一份数据跑两次，唯一差别是加不加 `--align-col`：
 
@@ -319,7 +319,7 @@ python benchmark_alignment.py examples/example_sequences.csv \
     --seq-col rna_seq --align-col structure
 ```
 
-### 3.4 占位符 `*[k]*`：k 的含义是被实证的，不是猜的
+### 4.4 占位符 `*[k]*`：k 的含义是被实证的，不是猜的
 
 用未被污染的参照列做侧翼锚定（`--flank 15`），量出真实跨度：
 
@@ -345,7 +345,7 @@ python verify_placeholder_semantics.py examples/placeholder_anchor_demo.csv \
     --seq-col seq_with_placeholder --ref-col reference_sequence --flank 15
 ```
 
-### 3.5 产出可用性对比
+### 4.5 产出可用性对比
 
 ```bash
 python benchmark_model_ready.py <raw.csv> --seq-col Sequence --chart benchmark/model_ready.png
