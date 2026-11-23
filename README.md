@@ -88,7 +88,81 @@ python verify_placeholder_semantics.py examples/placeholder_anchor_demo.csv \
 
 ---
 
-## 二、与邻近工具的差别
+## 二、LLM 到底在哪里起作用（以及哪里不需要它）
+
+这个问题必须先答清楚，否则"skill / agent"就只是包装。
+
+**清洗本身不需要模型。** 把字符映射进已知词表是确定的：规则更快、更稳、更便宜、可复现，
+所以 `curate.py` 的默认路径**一行 LLM 都不调**，全量跑是零成本。
+
+**模型不可替代的地方只有一处：面对一份陌生的脏数据，判断那些记号是什么意思。**
+脚本只能执行人已经想好的规则；没人告诉它 `*[k]*` 是什么时，它无从下手。
+
+### 内置的"语义专家"模块：`discover_conventions.py`
+
+这就是让本仓库配得上 skill 的模块，也是为什么必须引入 LLM。它给模型划了一条**不可越界的线**：
+
+```
+LLM 负责「提出可证伪的假设」  →  代码负责「跑实验判定真假」
+```
+
+| 阶段 | 谁做 | 内容 |
+|---|---|---|
+| 1 观察 | 代码（确定性） | 扫描数据，找出可疑记号：`*[k]*`、小写、gap、裸数字、模糊码……给出分布和样例 |
+| 2 提议 | **LLM** | 对每个记号提出假设，并**只能从受支持的预测清单里选一个**来验证 |
+| 3 验证 | 代码（确定性） | 用参照列做侧翼锚定，量出真实跨度；模型不参与判定 |
+| 4 裁定 | 代码（确定性） | 预测成立 → `CONFIRMED`；不成立 → `REFUTED`；无法验证 → `UNTESTABLE` |
+
+**关键设计：模型不能说"看起来像"。** 它必须说"我预测 X 成立"，
+然后由代码去量。它挑不出验证方案，该假设直接标 `UNTESTABLE`，绝不当成通过。
+这既用上了模型对陌生格式的联想能力，又不给它幻觉的机会。
+
+实测（本地原始数据，`--flank 15`）：
+
+| 记号 | 假设（LLM 提出） | 预测 | 样本 | 命中率 | 裁定 |
+|---|---|---|---|---|---|
+| `*[k]*` | 计数 | 跨度 == 记号里的数字 | 3,000 | **100.0%** | **CONFIRMED** |
+| `*[k]*` | 固定宽度注解 | 跨度 == 记号文本宽度 | 3,000 | 2.1% | **REFUTED** |
+| 小写字母 | 低置信度位点 | 跨度 == 记号宽度（1） | 3,013 | **100.0%** | **CONFIRMED** |
+
+第三条的结论有实际含义：**小写字母恰好占据一个真实碱基位置**，说明它是"低置信度的碱基调用"，
+而不是被插入的注解——这正是"转大写并保留"这个处理动作的依据，而它是**被实验证明的，不是被规定的**。
+
+确认的假设会输出成规则建议，人工过目后才交给 `curate.py`：
+
+```json
+[{"regex": "\\*\\[ *(\\d+)\\]\\*", "action": "expand_to_n_by_number",
+  "evidence": "锚定 3000 例，命中率 1.0", "maps_to": "占位符 -> k 个 N"},
+ {"regex": "[a-z]", "action": "uppercase_keep",
+  "evidence": "锚定 3013 例，命中率 1.0", "maps_to": "小写 -> 同一碱基的大写（非插入记号）"}]
+```
+
+**离线可复现**：仓库自带 `examples/convention_discovery_demo.csv`（合成，60 行，
+含 `*[k]*` 与小写），mock 假设下即可看到 `CONFIRMED / WEAK / CONFIRMED` 的完整裁定：
+
+```bash
+python discover_conventions.py examples/convention_discovery_demo.csv \
+    --seq-col seq_with_markers --ref-col reference_sequence --llm mock
+
+# 接入任意模型：命令从 stdin 读 prompt、回复写 stdout（无需改代码、无第三方依赖）
+python discover_conventions.py <raw.csv> --seq-col Sequence --ref-col FASTA_sequence \
+    --llm-cmd "python my_llm_bridge.py" --emit-rules rules.json
+```
+
+**换一份陌生数据，这个循环照样跑**：观察 → 提假设 → 锚定验证 → 裁定。
+这就是"下载后可泛化使用"的那部分。
+
+### 意外的副产品：这个模块抓出了自己的一个缺陷
+
+第一版锚定探测器对"小写字母"样本数是 **0**。原因真实且隐蔽：小写字母的侧翼窗口里
+混着 `*[k]*` 这类记号，而参照列里没有这些符号 → 锚点永远匹配失败 → 样本数静默变成 0。
+
+修法是**侧翼只收字母，碰到噪声就停**（宁可侧翼短，也不污染锚点）。
+这类"静默零样本"正是本仓库反复强调要防的失败模式，这次是它自己在自己身上发生的。
+
+---
+
+## 三、与邻近工具的差别
 
 这些工具都很成熟，本项目不是它们的替代品，而是在它们没有覆盖的位置上工作：
 
@@ -101,7 +175,8 @@ python verify_placeholder_semantics.py examples/placeholder_anchor_demo.csv \
 | 独立复核脚本 | 罕见 | **刻意不复用实现**的验证器 |
 | 注释列寄存器保持 | 不在其职责内 | `--align-col` 同步变换；无法证明对齐则拒绝 |
 | 静默猜错防护 | 视工具而定 | 列/类型/配对不确定一律停止，**不写结果** |
-| 未知约定实证 | 不涉及 | 锚定法脚本 + 合成演示样例 |
+| 未知约定实证 | 不涉及 | **`discover_conventions.py`：LLM 提假设、代码跑实验判定**（见 §二），可在任何陌生数据上泛化 |
+| 可泛化的语义专家模块 | 无（规则写死） | 观察 → 提假设 → 锚定验证 → 裁定的完整循环，含受支持的预测清单与 `UNTESTABLE` 保守兜底 |
 
 补充两点实际影响：
 
@@ -113,7 +188,7 @@ python verify_placeholder_semantics.py examples/placeholder_anchor_demo.csv \
 
 ---
 
-## 三、实测数据
+## 四、实测数据
 
 以下全部数字来自**一份本地原始数据**（未随仓库提供，故只给数值与复现命令）。
 每组实验都可用你自己的数据复跑。
@@ -204,16 +279,21 @@ python benchmark_model_ready.py <raw.csv> --seq-col Sequence --chart benchmark/m
 
 ![目标导向对比](benchmark/model_ready.png)
 
-| 方法 | 输出合法率 | 数据产出 | 序列保留 |
-|---|---|---|---|
-| 本项目规则 | 100.00% | **100.2%** | 全部 |
-| seismic cleanfa | 100.00% | 93.5% | 全部 |
-| 朴素删除脚本 | 100.00% | 93.5% | 全部 |
-| SNIP（蛋白白名单） | — | — | **0** |
+| 方法 | 输出合法率 | 输出字符数 | 字符净变化 | 序列保留 |
+|---|---|---|---|---|
+| 本项目规则 | 100.00% | 5,652,399 | **+8,731** | 全部 |
+| seismic cleanfa | 100.00% | 5,276,138 | −367,530 | 全部 |
+| 朴素删除脚本 | 100.00% | 5,275,980 | −367,688 | 全部 |
+| SNIP（蛋白白名单） | — | — | — | **0** |
 
 - **合法率**：输出字符 ∈ 目标字母表 的比例。<100% 就意味着有字符喂不进模型。
-- **数据产出**：输出字符数 / 原始字符数。本项目 >100% 是因为占位符被还原为缺失的碱基，
-  这部分长度在另外两种输出里是丢失的。
+- **净变化**：输出字符数 − 输入字符数。**这里用绝对字符数而不是百分比**，
+  因为比值会超过 100%，容易被误读成"注水"。
+  `>0` 的含义是：**输入本身已经被上游删掉了一部分碱基**（占位符就是那些缺失的痕迹），
+  还原后比输入长。而 cleanfa / 朴素脚本会把这段长度连同 gap 一起丢掉，所以是负数。
+
+  换句话说，本项目在这份数据上比"输入"多补回 8,731 个字符，
+  而其他两种做法比输入少 36.7 万个——差距不只在百分比，而在**能否对齐原始生物学长度**。
 - SNIP 是蛋白工具（白名单仅 20 种标准氨基酸），用在核酸数据上会**整条删光且不报错**——
   这正是 §1.4 那类防护要拦的情形。
 
@@ -222,7 +302,7 @@ python benchmark_model_ready.py <raw.csv> --seq-col Sequence --chart benchmark/m
 
 ---
 
-## 四、快速开始
+## 五、快速开始
 
 ```bash
 # 1) 清理（自动检测序列列；输出保证 100% 在目标字母表内）
@@ -232,12 +312,16 @@ python curate.py <sequences.csv> --out cleaned_output
 python validate_model_ready.py cleaned_output/cleaned.csv \
     --align-col rna_seq=structure_curated
 
-# 3) 遇到未知的占位约定，先实证再处理
-python verify_placeholder_semantics.py <raw.csv> \
-    --seq-col Sequence --ref-col FASTA_sequence --flank 15
+# 3) 遇到陌生记号：让模型提假设、由代码跑实验判定（离线可跑）
+python discover_conventions.py examples/convention_discovery_demo.csv \
+    --seq-col seq_with_markers --ref-col reference_sequence --llm mock
 
-# 4) 自检
+# 4) 寄存器保持量化（同一数据开/关 --align-col 跑两次）
+python benchmark_alignment.py <raw.csv> --align-col Structure
+
+# 5) 自检
 python test_curate_entry.py    # 入口回归（含"全表无字母表外字符"断言）
+python test_discover.py        # 发现循环回归（观察→假设→验证→裁定）
 python test_agent.py           # 语义分类组件回归
 python run_demo.py             # 合成用例：同一字符在不同上下文得到不同决策
 ```
@@ -277,22 +361,24 @@ cleaned, mapping, seq_type, alphabet = clean_sequence("ACGTNacgt-*[ 2]*", alphab
 
 ---
 
-## 五、架构
+## 六、架构
 
 ```
 curate.py                       清理主入口（字母表驱动 + 运行内合法性断言）
+discover_conventions.py         语义专家模块：LLM 提假设 + 代码跑实验判定（§二）
 validate_model_ready.py         独立复核器（刻意不复用清理实现）
-verify_placeholder_semantics.py 未知占位约定的实证方法（含合成演示样例）
-benchmark_model_ready.py        合法率 / 数据产出 对比 + 画图
+verify_placeholder_semantics.py 单一实验的独立实现（锚定法，便于单独复跑）
+benchmark_model_ready.py        合法率 / 字符净变化 对比 + 画图
 benchmark_alignment.py          寄存器保持 A/B 量化
 benchmark.py / draw_chart.py    合成用例上的语义判断对比与绘图
-semantic_seq_curator/           语义分类内核
+semantic_seq_curator/           逐位语义分类内核
   ├─ iupac.py                   IUPAC 映射表、修饰表、保守基序库
   ├─ downstream.py              下游任务 schema（词表容忍度与标签要求）
   ├─ tools.py                   Tool 抽象 + 工具注册表
   ├─ agent.py                   Reasoner（规则 / LLM 可插拔）+ ReAct 循环
-  └─ autonomous.py              由 LLM 面对原始序列自主发现语义 + 规则沉淀
+  └─ autonomous.py              让 LLM 直接对序列做语义分类的接口
 test_curate_entry.py            入口回归测试
+test_discover.py                发现循环回归测试
 test_agent.py                   语义分类组件回归测试
 run_demo.py                     合成用例演示
 docs/                           竞品调研、差异说明、Skill 定义、System Prompt
@@ -300,13 +386,20 @@ examples/                       合成数据（可直接跑通全部脚本）
 benchmark/                      对比结果与图
 ```
 
-**分层设计**：规则引擎是主体，可独立完成全部清理（默认路径、零外部依赖、可离线规模化）。
-`Reasoner` 是接口，`RuleReasoner`（确定性、可单测）与 `LLMReasoner`（注入任意大模型）
-可互换——需要让模型参与长尾判断时替换推理器即可，清理主链路不变。
+**两层分工**（这也是"为什么是 skill"的答案）：
+
+| 层 | 文件 | 是否需要 LLM | 职责 |
+|---|---|---|---|
+| 执行层 | `curate.py` | **否** | 已确认的规则，全量、离线、零成本、可复现 |
+| 发现层 | `discover_conventions.py` | **是** | 面对陌生数据提出并验证假设，产出规则 |
+| 复核层 | `validate_model_ready.py` | 否 | 不复用实现的独立检查 |
+
+规则引擎（`semantic_seq_curator/`）是执行层的内核：默认路径 `RuleReasoner` 确定性、可单测；
+`LLMReasoner` 是可替换接口，需要模型参与长尾判断时替换推理器即可，主链路不变。
 
 ---
 
-## 六、边界与已知限制
+## 七、边界与已知限制
 
 写清楚边界，比假装没有边界更有用：
 
@@ -321,7 +414,7 @@ benchmark/                      对比结果与图
 
 ---
 
-## 七、相关工作与致谢
+## 八、相关工作与致谢
 
 | 工具 | 做什么 |
 |---|---|

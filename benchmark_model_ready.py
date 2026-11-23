@@ -145,37 +145,39 @@ def main(argv=None):
     print("=" * 90)
     print(f"序列列 {seq_col} / 目标字母表 {''.join(sorted(alphabet))}")
     print()
-    print(f"{'方法':<24}{'合法率':>10}{'数据产出':>12}{'序列保留':>14}{'可用字符数':>16}")
+    print(f"{'方法':<24}{'合法率':>10}{'输出字符数':>14}{'净变化':>14}{'序列保留':>14}")
     print("-" * 90)
     for name, r in stats.items():
         if r["total"] == 0:
-            valid_s, yield_s = "—", "—"
+            valid_s = "—"
         else:
             valid_s = f"{100 * r['valid'] / r['total']:.2f}%"
-            yield_s = f"{100 * r['total'] / r['orig']:.1f}%"
         fully_valid = r["total"] > 0 and r["valid"] == r["total"]
         top = r["total"] > 0 and abs(100 * r["total"] / r["orig"] - best_yield) < 0.05
         note = ""
         if fully_valid and top:
-            note = "  ← 既 100% 合法、又保留最多数据"
+            note = "  ← 既 100% 合法、又留下最多数据"
         elif r["total"] == 0:
             note = "  ← 整条丢弃，无可用数据"
+        net = r["total"] - r["orig"]
+        net_s = f"{net:+,}" if r["total"] else "—"
+        total_s = f"{r['total']:,}" if r["total"] else "—"
         kept_s = f"{r['kept']:,}/{r['rows']:,}"
-        print(f"{name:<24}{valid_s:>10}{yield_s:>12}{kept_s:>14}"
-              f"{r['valid']:>16,}{note}")
+        print(f"{name:<24}{valid_s:>10}{total_s:>14}{net_s:>14}{kept_s:>14}{note}")
         results[name] = {
             "valid_rate_pct": round(100 * r["valid"] / r["total"], 2) if r["total"] else None,
-            "data_yield_pct": round(100 * r["total"] / r["orig"], 2) if r["orig"] else None,
+            "output_chars": r["total"],
+            "input_chars": r["orig"],
+            "net_chars": net,
             "sequences_kept": r["kept"], "sequences_total": r["rows"],
             "usable_chars": r["valid"],
         }
     print("-" * 90)
-    print("合法率   = 输出字符 ∈ 目标字母表 的比例（<100% 就有字符喂不进模型）")
-    print("数据产出 = 输出字符数 / 原始字符数（保留了多少可用数据）")
-    print("序列保留 = 未被整条丢弃的序列数")
-    print()
-    print("注：本仓库规则的数据产出可能 >100%，因为占位符 *[k]* 被还原为 k 个缺失碱基（N），")
-    print("    这些长度在 cleanfa / 哑程序的输出里是丢失的。")
+    print("合法率     = 输出字符 ∈ 目标字母表 的比例（<100% 就有字符喂不进模型）")
+    print("净变化     = 输出字符数 - 输入字符数")
+    print("             >0 不是错误：输入本身已被上游删掉了一部分碱基（占位符就是痕迹），")
+    print("             还原后比输入更长；而 cleanfa / 哑程序会把这段长度丢掉，净变化为负。")
+    print("序列保留   = 未被整条丢弃的序列数")
 
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -202,32 +204,37 @@ def _draw(results, path, label):
     names = ["本仓库规则\n(模型就绪)", "seismic\ncleanfa", "纯 Python\n哑程序", "SNIP\n(蛋白白名单)"]
     keys = ["本仓库规则（模型就绪）", "seismic cleanfa", "纯 Python 哑程序", "SNIP（蛋白白名单）"]
     valid = [results[k]["valid_rate_pct"] or 0.0 for k in keys]
-    yield_ = [results[k]["data_yield_pct"] or 0.0 for k in keys]
+    # 图上直接用净变化字符数（比 >100% 的百分比直观，不会被误读成注水）
+    net = [results[k]["net_chars"] for k in keys]
 
     x = np.arange(len(names))
     w = 0.38
-    fig, ax = plt.subplots(figsize=(10, 5.2), dpi=150)
-    b1 = ax.bar(x - w / 2, valid, w, label="输出合法率（能否进模型输入口）", color="#2171b5")
-    b2 = ax.bar(x + w / 2, yield_, w, label="数据产出（多少数据留下来可用）", color="#9ecae1")
-    for bars in (b1, b2):
-        for bar in bars:
-            v = bar.get_height()
-            ax.annotate(f"{v:.1f}%", (bar.get_x() + bar.get_width() / 2, v),
-                        xytext=(0, 3), textcoords="offset points",
-                        ha="center", va="bottom", fontsize=9)
-    ax.axhline(100, color="#e6550d", linestyle="--", linewidth=1)
-    ax.annotate("100% = 无一个字符喂不进模型", (len(names) - 0.5, 100),
-                xytext=(-6, 6), textcoords="offset points", ha="right",
-                fontsize=8, color="#e6550d")
-    ax.set_ylabel("百分比（%）")
+    fig, ax = plt.subplots(figsize=(10.5, 5.2), dpi=150)
+    ax2 = ax.twinx()
+    b1 = ax.bar(x - w / 2, valid, w, label="输出合法率（%，左轴）", color="#2171b5")
+    b2 = ax2.bar(x + w / 2, net, w, label="字符净变化（相对输入，右轴）", color="#9ecae1")
+    for bar in b1:
+        v = bar.get_height()
+        ax.annotate(f"{v:.1f}%", (bar.get_x() + bar.get_width() / 2, v),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=9)
+    for bar in b2:
+        v = bar.get_height()
+        ax2.annotate(f"{v:+,}", (bar.get_x() + bar.get_width() / 2, v),
+                     xytext=(0, 3 if v >= 0 else -12), textcoords="offset points",
+                     ha="center", va="bottom", fontsize=9)
+    ax.set_ylabel("输出合法率（%）")
+    ax2.set_ylabel("字符净变化")
     ax.set_ylim(0, 118)
     ax.set_xticks(x)
     ax.set_xticklabels(names, fontsize=9)
     ax.set_title(f"清理输出能否直接训练（基于{label}，未随仓库提供）", fontsize=12)
-    ax.legend(loc="lower left", fontsize=9, framealpha=0.95)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, loc="lower left", fontsize=9, framealpha=0.95)
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    ax2.spines["top"].set_visible(False)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     plt.tight_layout()
     plt.savefig(path, bbox_inches="tight")

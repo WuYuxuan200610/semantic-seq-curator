@@ -1,98 +1,110 @@
 ---
 name: semantic-seq-curator
-description: 对蛋白质/核酸序列做"语义感知"清理与标注时使用。逐位判断每个非标准字符（IUPAC 模糊码、测序错误、功能修饰、未知异常）的生物学语义，记录可审计的决策理由，并按下游训练任务（预训练/分类）自动标注。绝不把非标准字符一律当噪声删除；与 seismic cleanfa、SNIP、ShortRead、ViralEntropR 等"哑清洗"工具相对。
+description: 当需要把生物序列清洗成语言模型可直接消费的输入、或需要判断一份陌生序列数据里非标准记号的真实含义时使用。提供两层能力：(1) 执行层——按声明的目标词表逐字符映射，保证输出 100% 合法 token，并同步保持注释列寄存器、导出逐字符变换账本；(2) 发现层——面对陌生记号，由 LLM 提出可证伪的假设、由代码跑锚定实验判定真假，产出 CONFIRMED/REFUTED/UNTESTABLE 裁定与规则建议。适用于新数据集接入、上游数据被工具改写后的取证、以及序列/注释必须逐位对齐的场景。
 ---
 
-# semantic-seq-curator — 生物序列语义感知清理与标注
+# semantic-seq-curator
 
-## 定位
+把生物序列变成**模型可读、可验证、可审计**的训练输入；并在遇到**陌生记号**时，
+用"模型提假设 + 代码做实验"的方式把它的含义**实证下来**，而不是猜。
 
-现有序列清洗工具（seismic cleanfa、SNIP、ShortRead、ViralEntropR 等）几乎都在做
-"哑替换"或"哑删除"：把 IUPAC 模糊码统一替换为 N，或把含模糊码的序列整条删除。
-它们把"不确定性"当作需要消灭的噪声。
+## 一、先分清两层职责（这是本 Skill 的核心）
 
-本 Skill 反其道而行：**把每个非标准字符当作信息载体，逐位判断其生物学语义，
-记录可审计的决策理由，并根据下游训练任务自动标注。**
-
-## 语义分类框架（逐位判断，不是整条过滤）
-
-对每一个非标准字符，必须归入以下四类之一，并给出引用具体依据的理由：
-
-| 类别 | 含义 | 处理 | 示例 |
+| 层 | 用不用 LLM | 职责 | 产物 |
 |---|---|---|---|
-| `sequencing_error` | 明确指向测序/格式错误（低质量 Phred 对应的碱基调用、同聚物滑动、格式乱码） | 标记，可选择移除或掩码 `<mask>` | 低质量区内的 N、乱码字符 |
-| `iupac_ambiguity` | 合法 IUPAC 模糊码，代表真实生物学不确定性 | **保留**，标注不确定等级；可转换为概率分布或"不确定"通道，**不**简单替换为 N | R/Y/S/W/K/M/B/D/H/V、N、X、蛋白 B/Z/J |
-| `functional_modification` | 已知对应功能修饰/特殊状态的字符 | **保留**，标注修饰类型 | 蛋白 U(硒代半胱氨酸)/O(吡咯赖氨酸)/*(终止子)、gap |
-| `unknown_artifact` | 无法归类的异常 | 标记为**需人工复核**，**不自动删除** | 任何查不到的符号 |
+| **执行层** | **不用** | 已确认的规则，按目标词表逐字符映射 | 合法序列 + 变换账本 + 注释列同步 |
+| **发现层** | **用** | 面对陌生记号提出并验证假设 | 裁定结论 + 规则建议 |
 
-## 逐位判断所需的外部知识（工具）
+**清洗不需要模型**（规则更快更稳更便宜）；**发现需要模型**（脚本无法对没见过的格式提出假设）。
+把这两件事混在一起，就是"用 LLM 逐字符扫描"——又贵又不稳，是本 Skill 明确不推荐的用法。
 
-Agent 不能只靠正则匹配。必须调用或检索：
+## 二、发现层：语义专家循环
 
-1. **`lookup_iupac_tool`** — 查询字符的 IUPAC 标准定义（合法？含义？可解释集合？）。
-2. **`modification_knowledge_tool`** — 查询是否为已知功能修饰/特殊状态。
-3. **`check_context_tool`** — 分析该字符附近上下文（是否在保守基序、同聚物/低复杂度区）。
-4. **`quality_evidence_tool`** — 拉取该位置质量证据（Phred），区分测序错误 vs 真实不确定性。
-5. **`fetch_downstream_schema_tool`** — 获取下游任务（预训练/分类）对特殊字符的容忍度与标签要求。
+当数据里出现无法解释的记号（如 `*[19]*`、成片小写、异常符号）时，按四阶段处理：
 
-> 若当前环境缺少某个知识源，必须如实标注"依据不足，降级为人工复核"，不能猜测。
+1. **观察（确定性）**：扫描数据，列出可疑记号、出现次数、分布与样例。
+2. **提议（LLM）**：对每个记号提出假设，并**从受支持的预测清单里选一个**来验证。
+   - `span_equals_token_width`：真实跨度 == 记号文本宽度（说明它只是注解）
+   - `span_equals_number_in_token`：真实跨度 == 记号里的数字（说明数字是被替换掉的基数）
+   - `span_equals_one` / `span_is_zero` / `span_exceeds_token_width`
+3. **验证（确定性）**：用**未被污染的参照列**做侧翼锚定，量出真实跨度。模型不参与判定。
+4. **裁定（确定性）**：
+   - `CONFIRMED`（命中率 ≥95%）→ 该假设成立，可转成规则建议
+   - `REFUTED`（≤5%）→ 证伪
+   - `WEAK` → 证据不足，**不得当作成立**
+   - `UNTESTABLE` → 无法验证（不足 20 样本 / 模型没给出可执行预测 / 没有参照列）
 
-## 逐位判断流程（ReAct 循环）
+### 不可让步的三条纪律
 
-```
-遇到非标准字符
-  → 思考：这个字符是什么？
-  → 行动：lookup_iupac_tool + modification_knowledge_tool
-  → 观察：工具返回的证据
-  → 思考：结合 check_context_tool + quality_evidence_tool + fetch_downstream_schema_tool
-  → 行动：生成 {semantic_class, reason, action, confidence} 标注
-```
+1. **模型只能说"我预测 X 成立"，不能直接下结论。** 判定权在代码手里。
+2. **预测名必须来自受支持的清单。** 模型编造的预测名会被置空，该假设判 `UNTESTABLE`。
+3. **无法验证 ≠ 通过。** 样本不足、缺参照列一律 `UNTESTABLE`，绝不"看起来像"就采用。
 
-降级纪律：工具查不到 → `unknown_artifact` / 人工复核，绝不编造。
+### 一条必须记住的教训
 
-## 按下游任务自动标注（标签 schema）
+**从已损坏数据派生出的注释列是循环证据。** 结构注释列等常常是由**已经损坏**的序列算出来的，
+它反映的是损坏后的状态，永远不能用来推断损坏前有多少内容。
+本 Skill 因此要求：判定长度类约定必须找**未被污染的同类参照列**（如原始提取序列）做锚定。
 
-- **语言模型预训练**（`protein_lm_pretraining` / `nucleic_lm_pretraining`）：
-  每位置输出 `{char, semantic_class, confidence, action_taken, uncertainty_level, encoding_hint}`；
-  每序列输出质量标签与可用的掩码建议。
-- **分类任务**（如 `enzyme_classification`）：
-  输出序列级 `{usable, quality_score, mask_suggestion, functional_flag, review_required}`。
+另一条：**侧翼只收字母，碰到噪声就停**。若把 `*`、`[` 等收进侧翼，参照列里就找不到锚点，
+样本数会**静默变成 0**，看起来像"无法验证"，实际是探测器缺陷。
 
-标签必须与逐位决策记录绑定，不能脱离理由单独存在。
+## 三、执行层：目标词表驱动的映射
 
-## 决策记录格式（可审计核心）
+### 目标字母表（先声明，再映射）
 
-输出结构化 `curation_log`（JSON Lines），每行对应一个非标准字符：
+| 档案 | 允许字符 |
+|---|---|
+| `dna` / `rna` | ACGTN / ACGUN |
+| `nucleic-mixed` | ACGTUN |
+| `dna-iupac` / `rna-iupac` | 标准碱基 + 全部 IUPAC 模糊码 + N（词表支持时保留信息） |
+| `protein` / `protein-extended` | 20AA+X / 20AA+X+BZJUO* |
 
-```json
-{"seq_id":"seq_dna","position":7,"original_char":"N",
- "semantic_class":"iupac_ambiguity",
- "reason":"IUPAC 模糊码：any base (A/C/G/T)。位置 7 位于保守基序 GATA-family TF binding site 内…",
- "action":"keep_annotate_uncertainty","confidence":0.85,
- "downstream_label":{"uncertainty_level":"defined","ambiguity_set":["A","C","G","T"]}}
-```
+### 映射规则（保证输出必属词表）
 
-`reason` 必须引用具体依据（如"IUPAC 标准：R = A/G""位置 42 位于已知活性位点 motif 内"），
-不能写"根据规则处理"。
+| 输入 | 处理 |
+|---|---|
+| 小写字母 | → 大写（比对惯例：低置信度/可变位点；其语义应由发现层实证） |
+| IUPAC 模糊码 | → `N`；`-iupac` 档案则原样保留 |
+| gap `-` `.` | → `N`（保持对齐）或删除 |
+| 占位符 `*[k]*` | → `k` 个 `N`（**前提：k 的含义已由发现层确认**） |
+| 其它未知字符 | → `N`/`X` 或删除 |
 
-## 依赖与实现
+### 三条硬约束
 
-本 Skill 的可执行核心是纯 Python 包（无第三方依赖）：
+1. **输出必须 100% 合法**：运行内断言 + 一份**不复用清理实现**的独立复核器二次检查。
+2. **注释列寄存器保持**：会改变长度的变换必须与注释列同步进行；
+   配对失败报错停止，行内长度不一致则跳过并记录，绝不硬猜位置。
+3. **失败即拒绝**：列名、类型、配对无法确定时**不写出任何结果**。
 
-- `semantic_seq_curator/iupac.py` — IUPAC 标准映射表、功能修饰表、保守基序库（知识源）
-- `semantic_seq_curator/downstream.py` — 下游任务 schema
-- `semantic_seq_curator/tools.py` — 5 个工具
-- `semantic_seq_curator/agent.py` — ReAct 循环 + 语义分类策略 + `CurationRecord`
-- `run_demo.py` — 最小验证（同一 N 不同上下文不同决策）
+## 四、输出契约
 
-运行：
+- 清理产物：每个序列列附带 `<列名>_curated`、`<列名>_seq_type`、`<列名>_alphabet`、
+  `<列名>_curation_summary`（逐行变换账本），另有列级映射汇总。
+- 发现产物：每个假设一条记录 `{记号, 假设, 预测, 样本数, 命中率, 裁定}`，
+  以及 `suggested_rules`（**需人工确认后才可用于执行层**）。
+
+## 五、适用与不适用
+
+**适用**：新数据集接入时判断陌生记号；上游工具已改写数据后的取证；
+序列与结构/比对注释必须逐位对齐的清洗；需要把清洗过程纳入审计链的场景。
+
+**不适用**：只是想"把非 ACGT 换成 N"——直接用 `seqkit replace` / `cleanfa` / Biopython 更快；
+没有未被污染的参照列时，长度类约定无法实证，本 Skill 会返回 `UNTESTABLE` 而不是猜测。
+
+## 六、实现与依赖
+
+纯 Python 标准库（画图需 matplotlib，可选）。核心文件：
+
+- `curate.py` — 执行层主入口
+- `discover_conventions.py` — 发现层（观察/提议/验证/裁定）
+- `validate_model_ready.py` — 独立复核器
+- `benchmark_alignment.py` — 寄存器保持 A/B 量化
+- `examples/convention_discovery_demo.csv` — 可离线跑通发现循环的合成数据
 
 ```bash
-python run_demo.py   # 产出 validation/curation_log.jsonl
+python discover_conventions.py examples/convention_discovery_demo.csv \
+    --seq-col seq_with_markers --ref-col reference_sequence --llm mock
+python curate.py examples/example_sequences.csv --align-col structure --out out
+python validate_model_ready.py out/cleaned.csv --align-col rna_seq=structure_curated
 ```
-
-## 竞品调研与空白
-
-详见 [RESEARCH.md](RESEARCH.md)。核心结论：现有工具是"字符级规则清洗"（哑替换/整条删除），
-本 Skill 是"语义级判断与记录"；bio-rs 是唯一做逐位符号级校验的工具但无语义归因，
-data-labelling 是可审计标注架构的最佳借鉴对象但对象是元数据而非序列。
