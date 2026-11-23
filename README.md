@@ -106,15 +106,97 @@ python verify_placeholder_semantics.py examples/placeholder_anchor_demo.csv \
 补充两点实际影响：
 
 - **数据产出**：占位符按计数还原后，cleanfa 与朴素删除脚本会丢失的那部分长度被补了回来
-  （见下方结果图的"数据产出"一栏，100.2% vs 93.5%）。
+  （实测 100.2% vs 93.5%，见 §3.5）。
+- **注释列寄存器保持**：不做同步时实测约 21.7% 的行会序列/注释错位（见 §3.3）。
 - **工具用错域会静默清零数据**：把蛋白白名单工具用在核酸数据上会把序列整条删光。
   这类"结果为空但不报错"的情形，正是上面第 4 条防护要拦的。
 
 ---
 
-## 三、结果
+## 三、实测数据
 
-下图基于一份**本地原始数据**（未随仓库提供）生成。你可用自己的数据复现：
+以下全部数字来自**一份本地原始数据**（未随仓库提供，故只给数值与复现命令）。
+每组实验都可用你自己的数据复跑。
+
+### 3.1 清理与独立复核的规模
+
+`curate.py` 自检 + `validate_model_ready.py`（不复用实现的独立副本）复核：
+
+| 指标 | 数值 |
+|---|---|
+| 行数 / 序列列数 | 23,535 / 8 |
+| 复核字符数 | **23,509,650** |
+| 字母表外字符（独立复核） | **0** |
+| 出现过的禁用字符集合 | `[]`（空） |
+| 输出实际出现的字符全集 | `ACGNTU` |
+| 序列与注释列错位的行 | **0** |
+
+```bash
+python curate.py <raw.csv> --align-col Structure --out out
+python validate_model_ready.py out/cleaned.csv --align-col Sequence=Structure_curated
+```
+
+### 3.2 变换账本（机器可读、逐行可查）
+
+同一份数据上，每一个被改动的字符都被计数，并可下钻到具体行：
+
+| 映射项 | 数量 |
+|---|---|
+| 小写 → 大写 | 524,997 |
+| gap → `N` | 327,843 |
+| 占位符 `*[k]*` → `k` 个 `N` | 6,680 个标记 → **48,418** 个字符 |
+| IUPAC 模糊码 → `N` | 2,097 |
+| 长度发生变化的行 | 5,109 |
+
+这正是"清洗"变成"契约"的地方：**改了多少、改成什么，是产物的一部分**，
+而不是隐藏在实现里。逐行明细在每行的 `<列名>_curation_summary`，列级汇总在同名 JSON。
+
+### 3.3 寄存器保持：不做同步会错位多少？（A/B 实验）
+
+同一份数据跑两次，唯一差别是加不加 `--align-col`：
+
+| 配置 | 行数 | 序列/注释错位行 | 错位率 |
+|---|---|---|---|
+| **A** `--align-col`（注释列同步变换） | 23,534 | **0** | **0.000%** |
+| **B** 不加（注释列保持原样） | 23,534 | 5,109 | **21.709%** |
+
+**不做同步，约 21.7% 的行会出现序列与注释错位**——而且这种错位不会报错，
+下游只会训出坏模型。这是本项目最实质的一项收益，也是它区别于"单列文本替换"的地方。
+
+```bash
+python benchmark_alignment.py <raw.csv> --align-col Structure
+# 仓库自带合成样例可离线复现（3 行，B 配置 100% 错位、A 配置 0）
+python benchmark_alignment.py examples/example_sequences.csv \
+    --seq-col rna_seq --align-col structure
+```
+
+### 3.4 占位符 `*[k]*`：k 的含义是被实证的，不是猜的
+
+用未被污染的参照列做侧翼锚定（`--flank 15`），量出真实跨度：
+
+| 判据 | 命中 / 可测样本 | 比例 |
+|---|---|---|
+| 真实跨度 == `k`（计数模型） | 2,168 / 2,168 | **100.00%** |
+| 真实跨度 == 标记文本宽度（编号模型） | 36 / 2,168 | 1.66% |
+
+结论：`k` 是该处丢失的碱基个数 → 应还原为 `k` 个 `N`。
+
+> 那 1.66% 的残余不是矛盾：当 `k` 与标记宽度**恰好相等**时（如 `*[5]*` 宽 5），
+> 两个判据本来就会给出同一答案。有判别力的样本上，两个模型完全分离。
+>
+> 另一个必须记住的教训：锚点太短会误匹配。`--flank 10` 时出现过 3/2967 的假阳性，
+> 加长到 15 后消失。**从已损坏数据派生出的注释列（如结构串）是循环证据**，
+> 不能用来自证长度——必须找未被污染的参照。
+
+```bash
+python verify_placeholder_semantics.py <raw.csv> \
+    --seq-col Sequence --ref-col FASTA_sequence --flank 15
+# 离线自检（合成样例）
+python verify_placeholder_semantics.py examples/placeholder_anchor_demo.csv \
+    --seq-col seq_with_placeholder --ref-col reference_sequence --flank 15
+```
+
+### 3.5 产出可用性对比
 
 ```bash
 python benchmark_model_ready.py <raw.csv> --seq-col Sequence --chart benchmark/model_ready.png
@@ -132,6 +214,8 @@ python benchmark_model_ready.py <raw.csv> --seq-col Sequence --chart benchmark/m
 - **合法率**：输出字符 ∈ 目标字母表 的比例。<100% 就意味着有字符喂不进模型。
 - **数据产出**：输出字符数 / 原始字符数。本项目 >100% 是因为占位符被还原为缺失的碱基，
   这部分长度在另外两种输出里是丢失的。
+- SNIP 是蛋白工具（白名单仅 20 种标准氨基酸），用在核酸数据上会**整条删光且不报错**——
+  这正是 §1.4 那类防护要拦的情形。
 
 另一张图（[benchmark/comparison.png](benchmark/comparison.png)）是在**合成用例**上
 对语义判断正确性的对比，与真实数据无关。
@@ -200,6 +284,7 @@ curate.py                       清理主入口（字母表驱动 + 运行内合
 validate_model_ready.py         独立复核器（刻意不复用清理实现）
 verify_placeholder_semantics.py 未知占位约定的实证方法（含合成演示样例）
 benchmark_model_ready.py        合法率 / 数据产出 对比 + 画图
+benchmark_alignment.py          寄存器保持 A/B 量化
 benchmark.py / draw_chart.py    合成用例上的语义判断对比与绘图
 semantic_seq_curator/           语义分类内核
   ├─ iupac.py                   IUPAC 映射表、修饰表、保守基序库
