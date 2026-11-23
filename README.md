@@ -103,7 +103,8 @@ python verify_placeholder_semantics.py examples/placeholder_anchor_demo.csv \
 这就是让本仓库配得上 skill 的模块，也是为什么必须引入 LLM。它给模型划了一条**不可越界的线**：
 
 ```
-LLM 负责「提出可证伪的假设」  →  代码负责「跑实验判定真假」
+LLM 负责「提出可证伪的假设」「提出检索式」「从检索结果里提取可引用结论」
+代码负责「跑实验判定真假」「校验引用是否真实存在」
 ```
 
 | 阶段 | 谁做 | 内容 |
@@ -111,13 +112,30 @@ LLM 负责「提出可证伪的假设」  →  代码负责「跑实验判定真
 | 1 观察 | 代码（确定性） | 扫描数据，找出可疑记号：`*[k]*`、小写、gap、裸数字、模糊码……给出分布和样例 |
 | 2 提议 | **LLM** | 对每个记号提出假设，并**只能从受支持的预测清单里选一个**来验证 |
 | 3 验证 | 代码（确定性） | 用参照列做侧翼锚定，量出真实跨度；模型不参与判定 |
-| 4 裁定 | 代码（确定性） | 预测成立 → `CONFIRMED`；不成立 → `REFUTED`；无法验证 → `UNTESTABLE` |
+| 4 外部证据 | **LLM 提检索式并提取结论；代码校验引用** | 数据内判不了时，去查工具文档/论文/流程/论坛——**去查，而不是猜** |
+| 5 裁定 | 代码（确定性） | 按证据等级给出最终结论（见下表） |
 
 **关键设计：模型不能说"看起来像"。** 它必须说"我预测 X 成立"，
 然后由代码去量。它挑不出验证方案，该假设直接标 `UNTESTABLE`，绝不当成通过。
 这既用上了模型对陌生格式的联想能力，又不给它幻觉的机会。
 
-实测（本地原始数据，`--flank 15`）：
+### 证据是分层的：`DOCUMENTED` ≠ `CONFIRMED`
+
+像人类做研究一样，不同来源的证据强度不同，报告必须标明用的是哪一层：
+
+| 等级 | 证据来源 | 强度 |
+|---|---|---|
+| `CONFIRMED` | **数据内实验**（参照列锚定，可复现） | 最强 |
+| `DOCUMENTED` | **外部来源明确记载**：工具官方文档 / 论文 / 分析流程（须给出 URL 与原文片段） | 强，但未经数据验证 |
+| `REFUTED` | 数据内实验证伪 | — |
+| `WEAK` | 命中率介于 5%~95%，证据不足，**不得视为成立** | 弱 |
+| `UNVERIFIED_HYPOTHESIS` | 模型凭记忆提出、无可引用来源 | 仅作线索 |
+| `UNTESTABLE` | 无参照列、检索也无命中 | 不猜 |
+
+**防幻觉的硬约束**：模型引用的 URL **必须真的出现在检索结果里**，支撑片段必须与来源内容相符，
+否则结论被拒、降级为 `UNTESTABLE`。`test_discover.py` 中有对应断言。
+
+实测（本地原始数据，`--flank 15`，数据内有参照列）：
 
 | 记号 | 假设（LLM 提出） | 预测 | 样本 | 命中率 | 裁定 |
 |---|---|---|---|---|---|
@@ -128,28 +146,48 @@ LLM 负责「提出可证伪的假设」  →  代码负责「跑实验判定真
 第三条的结论有实际含义：**小写字母恰好占据一个真实碱基位置**，说明它是"低置信度的碱基调用"，
 而不是被插入的注解——这正是"转大写并保留"这个处理动作的依据，而它是**被实验证明的，不是被规定的**。
 
-确认的假设会输出成规则建议，人工过目后才交给 `curate.py`：
+当**没有参照列**时，流程自动转入第 4 阶段去查资料。离线合成演示（mock 检索，
+URL 用 `example.invalid` 占位，**不是真实文献**）：
+
+| 记号 | 数据内 | 外部证据 | 最终裁定 |
+|---|---|---|---|
+| `*[k]*` | UNTESTABLE | 命中官方文档，有原文片段 | `DOCUMENTED` |
+| 小写字母 | UNTESTABLE | 未查到关于它的记载 | `UNTESTABLE`（不硬套） |
+
+确认的假设会输出成规则建议，人工过目后才交给 `curate.py`，并标注证据等级：
 
 ```json
 [{"regex": "\\*\\[ *(\\d+)\\]\\*", "action": "expand_to_n_by_number",
-  "evidence": "锚定 3000 例，命中率 1.0", "maps_to": "占位符 -> k 个 N"},
- {"regex": "[a-z]", "action": "uppercase_keep",
-  "evidence": "锚定 3013 例，命中率 1.0", "maps_to": "小写 -> 同一碱基的大写（非插入记号）"}]
+  "evidence_tier": "CONFIRMED", "evidence": "数据内锚定 3000 例，命中率 1.0",
+  "requires_small_sample_check": false, "maps_to": "占位符 -> k 个 N"}]
 ```
 
-**离线可复现**：仓库自带 `examples/convention_discovery_demo.csv`（合成，60 行，
-含 `*[k]*` 与小写），mock 假设下即可看到 `CONFIRMED / WEAK / CONFIRMED` 的完整裁定：
+**接入真实检索与真实模型**（本会话未能实测，见下方说明）：
 
 ```bash
+# 检索桥：从 stdin 读查询串，把 JSON 结果列表写 stdout，每条为 {title, url, snippet}
+python discover_conventions.py <raw.csv> --seq-col Sequence \
+    --llm-cmd "python llm.py" --search-cmd "python search.py" --emit-rules rules.json
+```
+
+> ⚠️ **诚实说明**：本次开发会话中，联网检索后端因账户余额不足（HTTP 402）不可用，
+> 因此**外部证据阶段只跑通了离线 mock 路径**（合成 URL、合成片段）。
+> `--search-cmd` 的真实检索链路**未经端到端验证**——接口与防幻觉校验已实现并有单测覆盖，
+> 但"接上真实搜索引擎后能否稳定提取到可靠引用"我没有实测数据，不作宣称。
+
+**离线可复现**：仓库自带 `examples/convention_discovery_demo.csv`（合成，60 行）：
+
+```bash
+# 有参照列 → 走数据内验证
 python discover_conventions.py examples/convention_discovery_demo.csv \
     --seq-col seq_with_markers --ref-col reference_sequence --llm mock
 
-# 接入任意模型：命令从 stdin 读 prompt、回复写 stdout（无需改代码、无第三方依赖）
-python discover_conventions.py <raw.csv> --seq-col Sequence --ref-col FASTA_sequence \
-    --llm-cmd "python my_llm_bridge.py" --emit-rules rules.json
+# 无参照列 → 自动转入外部证据检索
+python discover_conventions.py examples/convention_discovery_demo.csv \
+    --seq-col seq_with_markers --llm mock --search mock
 ```
 
-**换一份陌生数据，这个循环照样跑**：观察 → 提假设 → 锚定验证 → 裁定。
+**换一份陌生数据，这个循环照样跑**：观察 → 提假设 → 锚定验证 → 查资料 → 裁定。
 这就是"下载后可泛化使用"的那部分。
 
 ### 意外的副产品：这个模块抓出了自己的一个缺陷

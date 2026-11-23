@@ -16,11 +16,15 @@ import os
 import sys
 
 from discover_conventions import (
+    DOCUMENTED_SOURCES,
     MIN_SAMPLES,
     SUPPORTED_PREDICTIONS,
+    VERDICT_MEANING,
     evaluate_predictions,
+    external_verdict,
     main,
     observe,
+    parse_claim,
     parse_hypotheses,
     probe_anchor_span,
     verdict,
@@ -47,8 +51,17 @@ def run_cli(argv):
 
 
 def table_part(out):
-    """只取裁定表格部分——图例里永远写着 CONFIRMED 等字样，不能拿来当判据。"""
-    return out.split("CONFIRMED = 预测成立")[0]
+    """只取裁定表格的表格体（两条长分隔线之间）。
+
+    不能用"图例文字"来切分：等级说明里本来就写着 CONFIRMED 等字样，
+    切不干净会把图例当成表格行，导致断言失真。
+    """
+    lines = out.splitlines()
+    dashes = [i for i, line in enumerate(lines)
+              if line.strip() and set(line.strip()) == {"-"} and len(line.strip()) > 20]
+    if len(dashes) >= 2:
+        return "\n".join(lines[dashes[0] + 1:dashes[1]])
+    return out
 
 
 # ---------------------------------------------------------------- 受支持的预测是封闭集合
@@ -104,12 +117,13 @@ check("宽度假设未被误判为成立（应 WEAK 或 REFUTED）",
 check("小写假设被 CONFIRMED 且样本非零",
       "lowercase_letters" in out and "0        —" not in out)
 
-# ---------------------------------------------------------------- 缺参照列 → 一律 UNTESTABLE
+# ------------------------------------------- 缺参照列且未接检索：一律 UNTESTABLE
 code2, out2 = run_cli([DEMO, "--seq-col", "seq_with_markers", "--llm", "mock"])
-check("未提供参照列时全部 UNTESTABLE（不给猜测留后门）",
+check("无参照列且未接检索接口时全部 UNTESTABLE（不给猜测留后门）",
       code2 == 0 and "UNTESTABLE" in table_part(out2)
       and "CONFIRMED" not in table_part(out2)
-      and "REFUTED" not in table_part(out2))
+      and "REFUTED" not in table_part(out2)
+      and "DOCUMENTED" not in table_part(out2))
 
 # ---------------------------------------------------------------- 样本太少 → 不裁定
 code3, out3 = run_cli([ANCHOR, "--seq-col", "seq_with_placeholder",
@@ -117,6 +131,55 @@ code3, out3 = run_cli([ANCHOR, "--seq-col", "seq_with_placeholder",
 check("仅 3 行样本时不下结论",
       code3 == 0 and "UNTESTABLE" in table_part(out3)
       and "CONFIRMED" not in table_part(out3))
+
+# ---------------------------------------------------------------- 外部证据层
+HITS = [
+    {"title": "工具文档", "url": "https://real.example/docs#marker",
+     "snippet": "标记 *[k]* 表示该位置原有 k 个残基未能确定，已折叠为记号。"},
+    {"title": "论坛贴", "url": "https://real.example/forum/1",
+     "snippet": "这个记号在不同流程里含义不一致，请以工具文档为准。"},
+]
+
+# 防幻觉核心：模型不得引用检索结果里不存在的链接
+ghost = json.dumps({"claim": "它是计数", "source_url": "https://made-up.example/x",
+                    "supporting_snippet": "标记 *[k]* 表示该位置原有 k 个残基未能确定，已折叠为记号。",
+                    "source_type": "official_docs"}, ensure_ascii=False)
+claim, why = parse_claim(ghost, HITS)
+check("引用不存在的来源被拒绝（防编造引用）", claim is None and "不存在" in why)
+
+# 支撑片段必须真的来自来源
+mismatch = json.dumps({"claim": "它是计数", "source_url": "https://real.example/docs#marker",
+                       "supporting_snippet": "文档里根本没写这句话。",
+                       "source_type": "official_docs"}, ensure_ascii=False)
+claim2, why2 = parse_claim(mismatch, HITS)
+check("支撑片段与来源不符被拒绝", claim2 is None and "不符" in why2)
+
+# 合法引用被接受，并按来源类型定级
+good = json.dumps({"claim": "k 是被折叠的残基数",
+                   "source_url": "https://real.example/docs#marker",
+                   "supporting_snippet": "标记 *[k]* 表示该位置原有 k 个残基未能确定，已折叠为记号。",
+                   "source_type": "official_docs"}, ensure_ascii=False)
+claim3, why3 = parse_claim(good, HITS)
+check("合法引用被接受", claim3 is not None and not why3)
+check("官方文档 → DOCUMENTED", external_verdict(claim3) == "DOCUMENTED")
+
+forum = dict(claim3, source_type="forum")
+check("论坛来源降级为 UNVERIFIED_HYPOTHESIS（可靠性不足）",
+      external_verdict(forum) == "UNVERIFIED_HYPOTHESIS")
+check("未提取到结论 → UNTESTABLE", external_verdict(None) == "UNTESTABLE")
+check("DOCUMENTED 与 CONFIRMED 在清单中是不同等级",
+      "DOCUMENTED" in VERDICT_MEANING and "CONFIRMED" in VERDICT_MEANING
+      and "official_docs" in DOCUMENTED_SOURCES)
+
+# 端到端：无参照列时走外部证据，且不同记号得到不同结论
+code4, out4 = run_cli([DEMO, "--seq-col", "seq_with_markers",
+                       "--llm", "mock", "--search", "mock"])
+check("无参照列时仍能给出结论（不再一律 UNTESTABLE）",
+      code4 == 0 and "DOCUMENTED" in table_part(out4))
+check("未查到记载的记号仍为 UNTESTABLE（不硬套）",
+      "UNTESTABLE" in table_part(out4))
+check("外部来源与其原文片段被打印出来",
+      "real" not in out4 and "example.invalid" in out4 and "残基未能确定" in out4)
 
 print()
 if FAILURES:
