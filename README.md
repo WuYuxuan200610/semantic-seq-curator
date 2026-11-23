@@ -413,6 +413,17 @@ python benchmark_model_ready.py <raw.csv> --seq-col Sequence --chart benchmark/m
 
 ## 五、快速开始
 
+### 获取
+
+```bash
+git clone https://github.com/<你的用户名>/semantic-seq-curator.git
+cd semantic-seq-curator
+```
+
+只需要 Python 3.9+，**无第三方依赖**（`matplotlib` 仅画图时需要，可选）。
+
+### 跑一遍
+
 ```bash
 # 1) 清理（自动检测序列列；输出保证 100% 在目标字母表内）
 python curate.py <sequences.csv> --out cleaned_output
