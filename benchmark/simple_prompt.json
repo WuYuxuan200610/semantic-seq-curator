@@ -1,0 +1,12 @@
+[
+{"seq_id":"seq_dna","position":7,"char":"N","action":"keep","reason":"N 是 IUPAC 模糊碱基码（任意碱基 A/C/G/T），属规范歧义符号，无唯一常规碱基可替换，保留以标记未确定碱基。"},
+{"seq_id":"seq_dna","position":18,"char":"N","action":"keep","reason":"同位置 7：N 为 IUPAC 任意碱基歧义码，保留原样。"},
+{"seq_id":"seq_dna","position":27,"char":"R","action":"keep","reason":"R 是 IUPAC 嘌呤歧义码（A/G），无唯一常规碱基可替换，保留原样。"},
+{"seq_id":"seq_dna","position":28,"char":"X","action":"remove","reason":"X 不是核酸字母表中的有效符号（系氨基酸的\"未知\"码），作噪声删除。"},
+{"seq_id":"seq_prot","position":12,"char":"U","action":"replace","reason":"U 是硒代半胱氨酸（第 21 种氨基酸），替换为其常规同源残基半胱氨酸 C。"},
+{"seq_id":"seq_prot","position":19,"char":"O","action":"replace","reason":"O 是吡咯赖氨酸（第 22 种氨基酸），替换为其常规同源残基赖氨酸 K。"},
+{"seq_id":"seq_prot","position":22,"char":"B","action":"keep","reason":"B 是 Asx 歧义码（天冬氨酸 D/天冬酰胺 N），无唯一常规残基可替换，保留原样。"},
+{"seq_id":"seq_prot","position":23,"char":"X","action":"keep","reason":"X 是规范\"未知氨基酸\"码，保留原样以标记未确定残基。"},
+{"seq_id":"seq_artifact","position":5,"char":"!","action":"remove","reason":"! 是标点符号，非核酸字符，作噪声删除。"},
+{"seq_id":"seq_artifact","position":10,"char":"?","action":"remove","reason":"? 是标点符号，非核酸字符，作噪声删除。"}
+]

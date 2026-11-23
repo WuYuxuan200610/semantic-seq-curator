@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 工具的默认输出目录与产物（清理结果属于数据，不入库）
+cleaned_output/
+curated_output*/
+*_output/
+demo_output/
+*.cleaned.csv
+validation/
+
+# 本地/编辑器
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,13 @@
+[
+{"seq_id":"seq_dna","position":7,"char":"N","action":"keep","reason":"N 是碱基未测定的通用占位符，保留原样以免编造碱基并维持序列长度"},
+{"seq_id":"seq_dna","position":18,"char":"N","action":"keep","reason":"N 表示未知碱基，保留可避免误填并维持序列长度"},
+{"seq_id":"seq_dna","position":27,"char":"R","action":"remove","reason":"R 不在标准 DNA 碱基（A/C/G/T）之列，属异常字符，删除以免污染训练"},
+{"seq_id":"seq_dna","position":28,"char":"X","action":"remove","reason":"X 不在标准 DNA 碱基（A/C/G/T）之列，属异常/未知字符，删除以免污染训练"},
+{"seq_id":"seq_prot","position":12,"char":"U","action":"remove","reason":"U 不是标准氨基酸字母（更常代表 RNA 碱基），删除以保持蛋白序列纯净"},
+{"seq_id":"seq_prot","position":19,"char":"O","action":"remove","reason":"O 不是标准氨基酸字母，属异常字符，删除"},
+{"seq_id":"seq_prot","position":22,"char":"B","action":"remove","reason":"B 不是标准氨基酸字母，属异常字符，删除"},
+{"seq_id":"seq_prot","position":23,"char":"X","action":"remove","reason":"X 表示未知/异常氨基酸，删除以免污染训练"},
+{"seq_id":"seq_prot","position":24,"char":"*","action":"remove","reason":"* 是终止符号而非氨基酸，不属于蛋白序列，删除"},
+{"seq_id":"seq_artifact","position":5,"char":"!","action":"remove","reason":"! 是标点符号，不属于 DNA 序列，删除"},
+{"seq_id":"seq_artifact","position":10,"char":"?","action":"remove","reason":"? 是标点符号，不属于 DNA 序列，删除"}
+]

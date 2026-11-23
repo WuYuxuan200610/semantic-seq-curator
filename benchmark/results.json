@@ -1,0 +1,32 @@
+{
+  "白板 Agent": {
+    "retention": 0.1111111111111111,
+    "noise_removal": 0.5,
+    "explainability": 1.0,
+    "accuracy": 0.18181818181818182
+  },
+  "简单 Prompt": {
+    "retention": 0.4444444444444444,
+    "noise_removal": 0.5,
+    "explainability": 0.9090909090909091,
+    "accuracy": 0.45454545454545453
+  },
+  "seismic cleanfa": {
+    "retention": 0.1111111111111111,
+    "noise_removal": 0.5,
+    "explainability": 0.0,
+    "accuracy": 0.18181818181818182
+  },
+  "SNIP": {
+    "retention": 0.0,
+    "noise_removal": 1.0,
+    "explainability": 0.0,
+    "accuracy": 0.18181818181818182
+  },
+  "本 Agent": {
+    "retention": 1.0,
+    "noise_removal": 1.0,
+    "explainability": 1.0,
+    "accuracy": 1.0
+  }
+}
