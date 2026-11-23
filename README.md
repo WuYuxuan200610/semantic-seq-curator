@@ -197,37 +197,10 @@ python discover_conventions.py <raw.csv> --seq-col Sequence \
 **校验不因来源不同而放松**：即使证据是 agent 提供的，URL 仍必须真实出现在该记号的 hits 里、
 支撑片段仍必须与来源相符，否则结论被拒、降级 `UNTESTABLE`。
 
-**关于宿主（DSH）联网能力的实测记录**
+**检索顺序由待查清单给出**：代码搜索优先——这类记号的权威定义通常就写在生成它的源码里；
+其次是产生该记号的工具的官方文档，再次论文/分析流程文档，最后论坛。
 
-| 途径 | 状态 | 说明 |
-|---|---|---|
-| `web_fetch`（直连 URL） | ✅ 可用 | 可抓取任意 http(s) 页面 |
-| `web_search`（关键词检索） | ❌ 不可用 | HTTP 402：搜索端点由模型 provider 的 base URL 推导，接入外部 API 时不覆盖 DeepSeek 的 `tools/search` |
-| web_fetch → Bing | ⚠️ 能抓但无用 | 返回 HTTP 200，但结果完全不相关（搜序列记号返回医学论文/视频网站） |
-| web_fetch → grep.app | ❌ 429 | Vercel 反爬拦截 |
-| web_fetch → Sourcegraph | ❌ 403 | 防火墙拦截 |
-| web_fetch → GitHub code search API | ❌ 连接失败 | 需要认证令牌 |
-
-**两条重要结论**：
-
-1. **抓取与检索是两件独立的事**。抓取可用，不代表能做关键词检索；反之亦然。
-   本设计不依赖任何特定检索后端——agent 用它能用的任何工具，只要把结果整理成
-   `{title, url, snippet}`。
-2. **查"某个代码记号的含义"应该用代码搜索，不是网页搜索**。实测通用搜索引擎对这类查询
-   召回极差。这类记号的权威定义通常就写在**生成它的那段源码**里。
-   因此待查清单把检索路径按有效性排序，并列出已知障碍：
-
-```json
-{"search_strategy": {
-   "first_choice": "代码搜索：在源码里找生成该记号的字面量",
-   "second_choice": "产生该记号的工具的官方文档",
-   "third_choice": "论文或分析流程文档",
-   "last_resort": "论坛 / issue / 邮件列表",
-   "known_obstacles": ["通用搜索引擎召回差", "grep.app 可能 429", "Sourcegraph 可能 403",
-                       "GitHub code search API 需令牌"]}}
-```
-
-若宿主的检索能力可用（或你配置了可用的检索后端），把结果写成证据文件即可，脚本无需改动。
+agent 用它的任一联网工具完成检索，把结果写成证据文件即可，**脚本无需改动**。
 
 也保留一条**全自动路径**（`--search-cmd`），适合已有搜索引擎 API 的场景：
 

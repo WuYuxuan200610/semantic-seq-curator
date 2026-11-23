@@ -535,10 +535,9 @@ QUERY_MANIFEST_TEMPLATE = {
         "third_choice": "论文或分析流程文档",
         "last_resort": "论坛 / issue / 邮件列表",
         "known_obstacles": [
-            "通用搜索引擎：对代码记号类查询召回差，容易返回热门但不相关的词条",
-            "grep.app：可能返回 429（Vercel 反爬）",
-            "Sourcegraph：可能返回 403（防火墙/IP 限制）",
-            "GitHub code search API：需要认证令牌",
+            "通用搜索引擎对代码记号类查询召回差，容易返回热门但不相关的词条",
+            "部分代码搜索站有反爬或限流，可能拒绝自动抓取",
+            "GitHub 代码搜索 API 需要认证令牌",
         ],
     },
     "evidence_quality_rules": {
