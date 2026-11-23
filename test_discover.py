@@ -197,6 +197,10 @@ with open(QFILE, encoding="utf-8-sig") as f:
     manifest = json.load(f)
 check("清单含未解决记号与检索式建议",
       manifest["unresolved"] and manifest["unresolved"][0]["suggested_queries"])
+check("检索式建议含代码搜索优先顺序（实测网页搜索对记号无效）",
+      "code_search" in manifest["unresolved"][0]["suggested_queries"]
+      and "search_strategy" in manifest
+      and manifest["search_strategy"]["first_choice"].startswith("代码搜索"))
 check("清单含证据质量规则与回填 schema",
       "DOCUMENTED" in manifest["evidence_quality_rules"]
       and "response_schema" in manifest)

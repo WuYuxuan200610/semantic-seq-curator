@@ -518,12 +518,29 @@ def external_verdict(claim):
 # ---------------------------------------------------------------------------
 QUERY_MANIFEST_TEMPLATE = {
     "instructions": [
-        "对 unresolved 里的每一项，使用你的联网检索能力（web_search / web_fetch 等）查明该记号的约定。",
-        "优先找**产生该记号的工具**的官方文档；其次论文；再次分析流程文档；最后论坛/issue。",
+        "对 unresolved 里的每一项，使用你的联网检索能力查明该记号的约定。",
+        "**优先用代码搜索**（GitHub code search / grep.app / Sourcegraph 等），直接找生成该记号的源码。",
+        "  理由（实测教训）：通用网页搜索对『某个代码记号的含义』这类问题召回极差——",
+        "  实测搜索序列记号却返回了医学论文和视频网站；中文引擎对英文技术术语尤其不准。",
+        "  而这类记号的权威定义通常就写在生成它的那段代码里。",
+        "找到产生该记号的工具后，再查它的官方文档；其次论文；再次分析流程文档；最后论坛/issue。",
         "每条结论必须附带：能打开的 url、该页面上**原文出现**的片段、来源类型。",
+        "如果所有检索途径都被拦截或不可用（反爬、防火墙、欠费），如实留空——不要退化成猜测。",
         "查不到就如实留空——不要用相似记号的结论套用，不要凭记忆编造来源。",
         "把结果写成 JSON 到 --evidence文件，格式见 response_schema，然后重新运行本脚本并加 --evidence。",
     ],
+    "search_strategy": {
+        "first_choice": "代码搜索：在源码里找生成该记号的字面量（如 '*[' + 数字 + ']*' 的拼接）",
+        "second_choice": "产生该记号的工具的官方文档（README / docs / man page）",
+        "third_choice": "论文或分析流程文档",
+        "last_resort": "论坛 / issue / 邮件列表",
+        "known_obstacles": [
+            "通用搜索引擎：对代码记号类查询召回差，容易返回热门但不相关的词条",
+            "grep.app：可能返回 429（Vercel 反爬）",
+            "Sourcegraph：可能返回 403（防火墙/IP 限制）",
+            "GitHub code search API：需要认证令牌",
+        ],
+    },
     "evidence_quality_rules": {
         "DOCUMENTED": "需要 official_docs / peer_reviewed / protocol 级别的来源，"
                       "且 url 与原文片段都要能对应上",
@@ -573,14 +590,30 @@ def _emit_query_manifest(args, findings, need_external, by_pattern):
 
 
 def _suggest_queries(finding, info):
-    """给出检索式建议。agent 可以改，这只是起点。"""
+    """给出检索式建议。agent 可以改，这只是起点。
+
+    对"记号含义"这类问题，代码搜索比网页搜索有效得多，所以两类都给，
+    并标出推荐顺序。
+    """
     desc = info["description"]
     tokens = " ".join(str(t) for t in info.get("distinct", [])[:3])
-    return [
-        f"{tokens} sequence notation meaning".strip(),
-        f"{desc} 序列记号 含义 工具",
-        f"which tool produces {tokens} marker in sequence files".strip(),
-    ]
+    return {
+        "code_search": [
+            # 代码搜索：找生成该记号的字面量
+            f'"{tokens}"',
+            f"'{tokens[:2]}' sequence marker writer",
+            "sequence notation collapse residues marker",
+        ],
+        "docs_search": [
+            f"infernal OR viennarna sequence marker notation",
+            f"sequence alignment tool that writes *[n]* marker",
+        ],
+        "web_search": [
+            f"{tokens} sequence notation meaning".strip(),
+        ],
+        "note": "推荐顺序：code_search > docs_search > web_search；"
+                "实测网页搜索对代码记号类查询召回很差。",
+    }
 
 
 # ---------------------------------------------------------------------------
